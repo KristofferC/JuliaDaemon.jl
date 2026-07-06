@@ -718,7 +718,13 @@ function run_cli(args::Vector{String})
         cmd_eval_repl(ctx_for_eval_repl(flags), length(pos) >= 2 ? pos[2] : nothing)
         return
     elseif cmd == "transcript"
-        ctx = length(pos) >= 2 ? ctx_from_id(pos[2]) : make_ctx(flags)
+        ctx = if length(pos) >= 2
+            ctx_from_id(pos[2])
+        elseif find_project(get(flags, "project", nothing)) === nothing
+            ctx_from_only_running()
+        else
+            make_ctx(flags)
+        end
         cmd_transcript(ctx, flags)
         return
     end
