@@ -159,7 +159,7 @@ julia --startup-file=no --project="$WORK/ToyPkg" -e "
 include(\"$JLD_HOME/src/daemon.jl\")
 Main.JLDDaemon.serve_session(name=\"ci\")
 sess_var = 1234
-sleep(120)" >/dev/null 2>&1 &
+sleep(120)" > "$WORK/session.out" 2>&1 &
 SESSPID=$!
 for i in $(seq 1 120); do
     $JLD --id=ToyPkg-ci eval '1' >/dev/null 2>&1 && break
@@ -188,4 +188,16 @@ $J --no-autostart eval '1' >/dev/null 2>&1
 check "stopped daemon unreachable" 3 $?
 
 echo
-if [ $FAILS -eq 0 ]; then echo "PASS (all checks)"; else echo "FAIL ($FAILS checks)"; exit 1; fi
+if [ $FAILS -eq 0 ]; then
+    echo "PASS (all checks)"
+else
+    echo "FAIL ($FAILS checks)"
+    echo "===== diagnostics ====="
+    "$JLD" --project="$WORK/ToyPkg" list 2>&1
+    [ -f "$WORK/session.out" ] && { echo "--- session output ---"; cat "$WORK/session.out"; }
+    for d in "$XDG_CACHE_HOME"/julia-daemon/*/; do
+        echo "--- $d daemon.log (tail) ---"
+        tail -30 "$d/daemon.log" 2>/dev/null
+    done
+    exit 1
+fi
