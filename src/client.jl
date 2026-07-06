@@ -115,7 +115,15 @@ function ensure_env(julia, version; force=false)
     isempty(Base.DEPOT_PATH) && die("empty DEPOT_PATH; cannot locate a julia depot")
     minor = minor_of(version)
     envdir = joinpath(first(Base.DEPOT_PATH), "environments", "jld-v$minor")
-    if force || !isfile(joinpath(envdir, "Manifest.toml"))
+    # Re-resolve when the env is missing OR was created by an older jld with
+    # a different dependency list.
+    havedeps = try
+        prj = TOML.parsefile(joinpath(envdir, "Project.toml"))
+        all(d -> haskey(get(prj, "deps", Dict()), d), DAEMON_DEPS)
+    catch
+        false
+    end
+    if force || !isfile(joinpath(envdir, "Manifest.toml")) || !havedeps
         mkpath(envdir)
         info("setting up daemon environment @jld-v$minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
         code = "using Pkg; Pkg.add($(repr(DAEMON_DEPS)))"
@@ -178,6 +186,8 @@ function cmd_start(ctx, flags)
         return
     end
     mkpath(ctx.dir)
+    chmod(dirname(ctx.dir), 0o700)
+    chmod(ctx.dir, 0o700)  # the socket grants code execution as this user
     rm(joinpath(ctx.dir, "sock"), force=true)
     rm(joinpath(ctx.dir, "daemon.toml"), force=true)
     ver, julia = probe_julia(ctx.julia, ctx.project)
@@ -190,9 +200,11 @@ function cmd_start(ctx, flags)
         "startup" => startup,
     )
     threads !== nothing && (cfg["threads"] = threads)
-    open(joinpath(ctx.dir, "config.toml"), "w") do io
+    cfgtmp = joinpath(ctx.dir, ".config.toml.tmp")
+    open(cfgtmp, "w") do io
         TOML.print(io, cfg)
     end
+    mv(cfgtmp, joinpath(ctx.dir, "config.toml"), force=true)
 
     logio = open(log_path(ctx), "a")
     println(logio, "=== jld daemon launch $(Libc.strftime("%F %T", time())) ===")
@@ -251,7 +263,15 @@ function apply_cfg(ctx, flags, cfg)
 end
 
 function ensure_running(ctx, flags)
-    try_ping(ctx.dir) !== nothing && return
+    st = try_ping(ctx.dir)
+    if st isa Dict
+        # A daemon still running code from before a jld update behaves subtly
+        # differently (new request fields are silently ignored); say so.
+        get(st, "proto", 0) == JLD_PROTO ||
+            info("note: this daemon was started by a different jld version; `jld restart` to align it")
+        return
+    end
+    st === :timeout && return
     get(flags, "no-autostart", false) && die("daemon not running (autostart disabled)", 3)
     cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
 end
@@ -612,7 +632,9 @@ function cmd_connect(ctx, flags)
     inputsock = get(dt, "kind", "") == "session" ? "" : joinpath(ctx.dir, "repl.sock")
     info("connecting to $(ctx.id) (backspace for the local julia> prompt, Ctrl-D to exit)")
     script = joinpath(JLD_HOME, "src", "connect_repl.jl")
-    p = run(ignorestatus(`$julia --project=$(ctx.project) -i $script $sockpath $inputsock $(ctx.id)`))
+    # default_julia_env: the app shim pins JULIA_LOAD_PATH to the app env,
+    # which lacks @stdlib and would break the connect script's stdlib imports.
+    p = run(ignorestatus(setenv(`$julia --project=$(ctx.project) -i $script $sockpath $inputsock $(ctx.id)`, default_julia_env())))
     exit(p.exitcode)
 end
 

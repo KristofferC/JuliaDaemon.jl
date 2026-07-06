@@ -123,11 +123,18 @@ logmsg(msg) = (println(LOG_IO[], "[jld ", Libc.strftime("%T", time()), "] ", msg
 const TRANSCRIPT_PATH = Ref("")
 const TRANSCRIPT_LOCK = ReentrantLock()
 
+const TRANSCRIPT_MAX = 8 * 1024 * 1024
+
 function transcript_raw(s::AbstractString)
     isempty(TRANSCRIPT_PATH[]) && return
     lock(TRANSCRIPT_LOCK) do
         try
-            open(io -> write(io, s), TRANSCRIPT_PATH[], "a")
+            path = TRANSCRIPT_PATH[]
+            # Rotate rather than grow without bound; one generation kept.
+            if isfile(path) && filesize(path) > TRANSCRIPT_MAX
+                mv(path, path * ".1", force=true)
+            end
+            open(io -> write(io, s), path, "a")
         catch
         end
     end
@@ -277,10 +284,15 @@ function serve_session(; name::AbstractString="repl")
     sid = string(slug, "-", namesan, "-", bytes2hex(SHA.sha1(project * "\0" * namesan))[1:8])
     dir = joinpath(cache_root(), sid)
     mkpath(dir)
+    chmod(dirname(dir), 0o700)
+    chmod(dir, 0o700)  # the socket grants code execution as this user
     open(joinpath(dir, "config.toml"), "w") do io
         TOML.print(io, Dict{String,Any}(
             "project" => project, "name" => namesan, "kind" => "session",
             "julia" => joinpath(Sys.BINDIR, "julia"), "startup" => String[]))
+    end
+    atexit() do
+        rm(joinpath(dir, "sock"), force=true)
     end
     LOG_IO[] = open(joinpath(dir, "daemon.log"), "a")
     SESSION[] = true
@@ -375,6 +387,7 @@ function state_toml()
         "name" => NAME[],
         "transcript" => TRANSCRIPT_PATH[],
         "kind" => SESSION[] ? "session" : "daemon",
+        "proto" => JLD_PROTO,
     )
     if cur !== nothing
         d["current"] = first(cur.code, 120)
@@ -389,8 +402,16 @@ function accept_loop(server, requests)
             accept(server)
         catch e
             e isa InterruptException && continue
-            logmsg("accept loop terminated: $(sprint(showerror, e))")
-            return
+            # A deaf daemon is worse than a noisy one: only give up when the
+            # server itself is gone; transient errors (e.g. fd exhaustion)
+            # are retried.
+            if !isopen(server)
+                logmsg("accept loop terminated: $(sprint(showerror, e))")
+                return
+            end
+            logmsg("accept error (retrying): $(sprint(showerror, e))")
+            sleep(0.1)
+            continue
         end
         @async handle_connection(conn, requests)
     end

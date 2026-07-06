@@ -45,7 +45,9 @@ function serve_input(sockpath)
         conn = try
             Sockets.accept(server)
         catch
-            return
+            isopen(server) || return
+            sleep(0.1)
+            continue
         end
         @async begin
             try
