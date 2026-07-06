@@ -496,6 +496,33 @@ function ctx_from_only_running()
     ctx_from_id(only(running))
 end
 
+# Paste code into an attached `jld connect` REPL, as if typed there.
+function cmd_eval_repl(ctx, arg)
+    code = arg === nothing ? read(stdin, String) : arg
+    isempty(strip(code)) && die("no code given")
+    sockpath = joinpath(ctx.dir, "repl.sock")
+    issocket(sockpath) || die("no REPL attached to $(ctx.id); start one with `jld connect`", 3)
+    conn = try
+        connect(sockpath)
+    catch
+        die("attached REPL is gone (stale socket); reconnect with `jld connect`", 3)
+    end
+    write_frame(conn, "paste", code)
+    kind, _ = read_frame(conn)
+    close(conn)
+    kind == "done" || die("REPL did not acknowledge the paste", 3)
+end
+
+# eval-repl outside a project: target the unique attached REPL, if any.
+function ctx_for_eval_repl(flags)
+    find_project(get(flags, "project", nothing)) !== nothing && return make_ctx(flags)
+    attached = filter(id -> issocket(joinpath(cache_root(), id, "repl.sock")), known_ids())
+    isempty(attached) && die("no attached REPL found; start one with `jld connect`", 3)
+    length(attached) > 1 &&
+        die("multiple attached REPLs ($(join(attached, ", "))); run from the project or pass --project", 3)
+    ctx_from_id(only(attached))
+end
+
 function cmd_connect(ctx, flags)
     st = try_ping(ctx.dir)
     st === :timeout && die("daemon is unresponsive (busy in a non-yielding eval?); it cannot accept a REPL until the eval yields or finishes — see `jld status`, or `jld kill` if stuck", 3)
@@ -521,7 +548,8 @@ function cmd_connect(ctx, flags)
     env = copy(ENV)
     env["JULIA_LOAD_PATH"] = "@:$envdir:@stdlib"
     script = joinpath(JLD_HOME, "src", "connect_repl.jl")
-    p = run(ignorestatus(setenv(`$julia --project=$(ctx.project) -i $script $port`, env)))
+    inputsock = joinpath(ctx.dir, "repl.sock")
+    p = run(ignorestatus(setenv(`$julia --project=$(ctx.project) -i $script $port $inputsock`, env)))
     exit(p.exitcode)
 end
 
@@ -590,6 +618,8 @@ commands:
   connect [id]      attach an interactive REPL (RemoteREPL) to this project's daemon,
                     or to any daemon by id/prefix (see `jld list`); outside a project
                     with no id, connects to the single running daemon
+  eval-repl '<code>'  paste code into the attached `jld connect` REPL, exactly as if
+                    typed there (echoed at the prompt, output shown, ans set)
   logs [-f]         show daemon log
   setup             (re)install the daemon environment for the selected julia
   install           install the Claude Code skill (+ ~/.local/bin/jld symlink if jld is not on PATH)
@@ -668,6 +698,9 @@ function run_cli(args::Vector{String})
             make_ctx(flags)
         end
         cmd_connect(ctx, flags)
+        return
+    elseif cmd == "eval-repl"
+        cmd_eval_repl(ctx_for_eval_repl(flags), length(pos) >= 2 ? pos[2] : nothing)
         return
     end
     ctx = make_ctx(flags)

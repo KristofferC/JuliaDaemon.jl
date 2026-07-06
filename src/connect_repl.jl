@@ -1,8 +1,13 @@
-# Run via `julia -i connect_repl.jl <port>`: attaches this REPL to a jld
-# daemon's RemoteREPL server, entered with '>'.
-import RemoteREPL, REPL
+# Run via `julia -i connect_repl.jl <port> [input-sock]`: attaches this REPL
+# to a jld daemon's RemoteREPL server (entered with '>') and, if input-sock is
+# given, serves `jld eval-repl` paste requests on it.
+module JLDConnect
 
-function jld_connect(repl, port)
+import RemoteREPL, REPL, Sockets
+
+include("protocol.jl")
+
+function setup_remote_mode(repl, port)
     try
         # Wait for the interactive REPL to be fully up (startup.jl may be slow).
         t0 = time()
@@ -24,6 +29,56 @@ function jld_connect(repl, port)
     nothing
 end
 
+# Feed data into the terminal input buffer, as if it arrived from the tty.
+function inject_input(data::AbstractString)
+    tty = stdin
+    lock(tty.cond)
+    try
+        write(tty.buffer, data)
+        notify(tty.cond)
+    finally
+        unlock(tty.cond)
+    end
+end
+
+function serve_input(sockpath)
+    rm(sockpath, force=true)
+    server = try
+        Sockets.listen(sockpath)
+    catch err
+        @error "jld: cannot serve eval-repl requests" exception = err
+        return
+    end
+    atexit(() -> rm(sockpath, force=true))
+    while true
+        conn = try
+            Sockets.accept(server)
+        catch
+            return
+        end
+        @async begin
+            try
+                kind, payload = read_frame(conn)
+                if kind == "paste"
+                    # Bracketed-paste markers make LineEdit treat this exactly
+                    # like a terminal paste: echoed at the prompt, evaluated,
+                    # prompt redrawn.
+                    inject_input("\e[200~" * strip(payload, '\n') * "\e[201~\n")
+                    write_frame(conn, "done", "status = \"ok\"\n")
+                end
+            catch
+            end
+            try
+                close(conn)
+            catch
+            end
+        end
+    end
+end
+
+end # module
+
 let port = parse(Int, ARGS[1])
-    atreplinit(repl -> @async jld_connect(repl, port))
+    atreplinit(repl -> @async JLDConnect.setup_remote_mode(repl, port))
+    length(ARGS) >= 2 && @async JLDConnect.serve_input(ARGS[2])
 end

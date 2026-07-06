@@ -50,6 +50,8 @@ jld start           pre-warm; --startup='using MyPkg' runs at boot
 jld restart         reload from scratch (keeps recorded --startup)
 jld status | list | logs [-f] | stop | kill | interrupt
 jld connect [id]    attach an interactive human REPL (shares Main); id targets any daemon
+jld eval-repl '<code>'  paste code into the human's attached REPL (echoed + evaluated
+                    at whatever prompt is active there) — useful to show results
 ```
 
 Flags: `--project=PATH` (default: nearest Project.toml), `--name=N` /
