@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # End-to-end test for jld. Requires a working `julia` on PATH (or JLD_JULIA).
+# Hermetic: daemon state lives in a temp XDG_CACHE_HOME.
 set -uo pipefail
 
 JLD_HOME="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
 JLD="$JLD_HOME/bin/jld"
 WORK="$(mktemp -d)"
+export XDG_CACHE_HOME="$WORK/cache"
 NAME="e2e$$"
 FAILS=0
+SESSPID=""
 
 check() { # check <desc> <expected-exit> <actual-exit>
     if [ "$2" = "$3" ]; then echo "ok: $1"; else echo "FAIL: $1 (expected exit $2, got $3)"; FAILS=$((FAILS+1)); fi
@@ -16,14 +19,25 @@ checkout() { # checkout <desc> <needle> <haystack>
 }
 
 cleanup() {
-    "$JLD" --project="$WORK/ToyPkg" --name=$NAME kill >/dev/null 2>&1
-    rm -rf "$WORK" "${XDG_CACHE_HOME:-$HOME/.cache}"/julia-daemon/ToyPkg-$NAME-*
+    for n in $NAME iso; do
+        "$JLD" --project="$WORK/ToyPkg" --name=$n kill >/dev/null 2>&1
+    done
+    [ -n "$SESSPID" ] && kill -9 $SESSPID >/dev/null 2>&1
+    rm -rf "$WORK"
 }
 trap cleanup EXIT
 
 julia --startup-file=no -e "using Pkg; Pkg.generate(\"$WORK/ToyPkg\")" >/dev/null 2>&1
+# Pkg.generate's template varies across julia versions; use known content.
+cat > "$WORK/ToyPkg/src/ToyPkg.jl" <<'EOF'
+module ToyPkg
+greet() = print("Hello World!")
+end
+EOF
 cd "$WORK/ToyPkg"
 J="$JLD --name=$NAME"
+
+# ---- basic eval / revise / errors ----
 
 out=$($J eval 'using ToyPkg; ToyPkg.greet()' 2>/dev/null)
 check "autostart+load" 0 $?
@@ -47,20 +61,42 @@ check "error exit code" 1 $?
 out=$($J eval 'sqrt(-1)' 2>&1)
 checkout "backtrace shown" "DomainError" "$out"
 
+# ---- interrupts ----
+
 $J --timeout=2 eval 'sleep(60)' >/dev/null 2>&1
 check "timeout interrupt" 124 $?
 
+$J eval 'sleep(30)' >/dev/null 2>&1 &
+EVPID=$!
+sleep 2
+$J interrupt >/dev/null 2>&1
+wait $EVPID
+check "jld interrupt aborts the eval" 130 $?
+
 out=$($J eval '1 + 2' 2>/dev/null)
-check "daemon survived interrupt" 0 $?
+check "daemon survived interrupts" 0 $?
 checkout "daemon state intact" "3" "$out"
+
+# ---- busy behavior ----
+
+$J eval 'sleep(3); "first"' >/dev/null 2>&1 &
+sleep 1
+out=$($J eval '"second"' 2>&1)
+check "queued eval succeeds" 0 $?
+checkout "queueing is reported" "queued" "$out"
+wait
+
+$J eval 'Libc.systemsleep(5)' >/dev/null 2>&1 &
+sleep 1.5
+out=$($J status 2>/dev/null)
+checkout "status answers during CPU-bound eval" "busy" "$out"
+wait
+
+# ---- files, modules, scratch ----
 
 echo 'scratch_result = sum(1:10)' > "$WORK/scratch.jl"
 out=$($J run "$WORK/scratch.jl" 2>/dev/null; $J eval 'scratch_result' 2>/dev/null)
 checkout "run file + state persists" "55" "$out"
-
-out=$($J transcript 2>/dev/null)
-checkout "transcript records inputs" "scratch_result = sum(1:10)" "$out"
-checkout "transcript records outputs" "Hello World!" "$out"
 
 out=$($J --module=Wk eval 'wk_x = 7; wk_x' 2>/dev/null; $J eval 'Main.Wk.wk_x * 2, isdefined(Main, :wk_x)' 2>/dev/null)
 checkout "module workspace" "(14, false)" "$out"
@@ -69,9 +105,76 @@ out=$($J eval 'sc_ref = 5;' 2>/dev/null; $J eval-scratch 'sc_tmp = sc_ref * 3' 2
 checkout "eval-scratch sees Main, keeps nothing" "15
 false" "$out"
 
+# ---- introspection ----
+
 out=$($J stacks 2>/dev/null)
 check "stacks" 0 $?
 checkout "stacks reports threads" "Thread" "$out"
+
+out=$($J eval 'Main.JLDDaemon.id()' 2>/dev/null)
+checkout "daemon knows its id" "ToyPkg-$NAME" "$out"
+
+# ---- targeting ----
+
+out=$($JLD --id=ToyPkg-$NAME eval '"by id"' 2>/dev/null)
+checkout "eval by --id prefix" "by id" "$out"
+
+out=$($JLD --project="$WORK/ToyPkg" --name=iso eval 'iso_var = 1; "iso ok"' 2>/dev/null)
+checkout "second named daemon" "iso ok" "$out"
+out=$($J eval 'isdefined(Main, :iso_var)' 2>/dev/null)
+checkout "named daemons are isolated" "false" "$out"
+
+out=$($JLD --project="$WORK/ToyPkg" list 2>/dev/null)
+checkout "list shows both daemons" "ToyPkg-iso" "$out"
+
+# ---- transcript ----
+
+$J eval 'for i in 1:5000; println("spam ", i); end; "spammed"' >/dev/null 2>&1
+out=$($J transcript 2>/dev/null)
+checkout "transcript records inputs" "scratch_result = sum(1:10)" "$out"
+checkout "transcript records outputs" "Hello World!" "$out"
+checkout "transcript truncates big output" "bytes of output omitted" "$out"
+
+# ---- completion protocol (what the attached REPL uses) ----
+
+out=$(julia --startup-file=no -e "
+using Sockets
+include(\"$JLD_HOME/src/protocol.jl\")
+conn = connect(\"$XDG_CACHE_HOME/julia-daemon/\" * filter(startswith(\"ToyPkg-$NAME\"), readdir(\"$XDG_CACHE_HOME/julia-daemon\"))[1] * \"/sock\")
+write_frame(conn, \"complete\", \"partial = \\\"prin\\\"\nfull = \\\"prin\\\"\n\")
+kind, payload = read_frame(conn)
+print(kind, \": \", payload)" 2>/dev/null)
+checkout "completion frame answers" "println" "$out"
+
+# ---- session mode ----
+
+julia --startup-file=no --project="$WORK/ToyPkg" -e "
+include(\"$JLD_HOME/src/daemon.jl\")
+Main.JLDDaemon.serve_session(name=\"ci\")
+sess_var = 1234
+sleep(120)" >/dev/null 2>&1 &
+SESSPID=$!
+for i in $(seq 1 50); do
+    $JLD --id=ToyPkg-ci eval '1' >/dev/null 2>&1 && break
+    sleep 0.5
+done
+out=$($JLD --id=ToyPkg-ci eval 'sess_var + 1' 2>/dev/null)
+checkout "eval into a served session" "1235" "$out"
+$JLD --id=ToyPkg-ci stop >/dev/null 2>&1
+check "stop refused for sessions" 2 $?
+out=$($JLD --id=ToyPkg-ci eval '"session alive"' 2>/dev/null)
+checkout "session survived stop" "session alive" "$out"
+kill -9 $SESSPID >/dev/null 2>&1
+SESSPID=""
+
+# ---- gc / shutdown ----
+
+$JLD --project="$WORK/ToyPkg" --name=iso kill >/dev/null 2>&1
+sleep 0.5
+out=$($JLD --project="$WORK/ToyPkg" gc 2>&1)
+checkout "gc removes dead daemons" "removed" "$out"
+out=$($J eval '"still here"' 2>/dev/null)
+checkout "gc keeps live daemons" "still here" "$out"
 
 $J stop >/dev/null 2>&1
 $J --no-autostart eval '1' >/dev/null 2>&1

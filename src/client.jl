@@ -590,7 +590,11 @@ end
 function cmd_connect(ctx, flags)
     st = try_ping(ctx.dir)
     st === :timeout && die("daemon is unresponsive (busy in a non-yielding eval?); it cannot accept a REPL until the eval yields or finishes — see `jld status`, or `jld kill` if stuck", 3)
-    st === nothing && die("daemon not running; start it with `jld start`", 3)
+    if st === nothing
+        ensure_running(ctx, flags)
+        st = try_ping(ctx.dir)
+        st isa Dict || die("daemon did not come up; see `jld logs`", 3)
+    end
     st["busy"] && info("note: daemon is busy (`$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s); the REPL shares the session and runs alongside it")
     dt = something(daemon_toml(ctx), Dict{String,Any}())
     sockpath = joinpath(ctx.dir, "sock")
