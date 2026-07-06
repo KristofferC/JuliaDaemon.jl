@@ -44,8 +44,9 @@ Exit codes: 0 ok, 1 julia error, 2 usage, 3 daemon unavailable, 124 timeout,
 ## Julia versions
 
 `--julia=BIN` (or `JLD_JULIA`) picks the daemon's julia — e.g. an in-tree
-`usr/bin/julia` build. Daemon environments are created per minor version under
-`envs/` on first use. The wire protocol is plain text, so the `jld` CLI works
+`usr/bin/julia` build. Daemon dependencies are installed on first use into a
+named depot environment per minor version (`@jld-v1.12`, …), so the jld
+installation itself can be read-only. The wire protocol is plain text, so the `jld` CLI works
 against daemons of any version (handy when the dev build is broken mid-rebase:
 `status`/`logs`/`stop` still work). RemoteREPL attach does require the REPL's
 julia to match the daemon's.

@@ -88,12 +88,16 @@ end
 
 minor_of(ver) = (m = match(r"^(\d+)\.(\d+)\.", ver); m === nothing ? die("cannot parse julia version \"$ver\"") : "$(m[1]).$(m[2])")
 
+# The daemon's deps live in a named depot environment (@jld-v1.X), keyed by
+# julia minor version. Kept out of JLD_HOME so the installation can be
+# read-only; the depot must be writable for Pkg to work at all.
 function ensure_env(julia, version; force=false)
+    isempty(Base.DEPOT_PATH) && die("empty DEPOT_PATH; cannot locate a julia depot")
     minor = minor_of(version)
-    envdir = joinpath(JLD_HOME, "envs", "v$minor")
+    envdir = joinpath(first(Base.DEPOT_PATH), "environments", "jld-v$minor")
     if force || !isfile(joinpath(envdir, "Manifest.toml"))
         mkpath(envdir)
-        info("setting up daemon environment for Julia $minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
+        info("setting up daemon environment @jld-v$minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
         code = "using Pkg; Pkg.add($(repr(DAEMON_DEPS)))"
         run(pipeline(`$julia --startup-file=no --project=$envdir -e $code`, stdout=stderr, stderr=stderr))
     end
