@@ -35,7 +35,7 @@ jobs:
         run: test/e2e.sh
         timeout-minutes: 25
         env:
-          JLD_E2E_TRACE: ${{ runner.os == 'Windows' && '1' || '' }}
-          JLD_DEBUG: ${{ runner.os == 'Windows' && '1' || '' }}
+          JLD_E2E_TRACE: ${{ runner.os != 'Linux' && '1' || '' }}
+          JLD_DEBUG: ${{ runner.os != 'Linux' && '1' || '' }}
       - name: Remote REPL tests (pty)
         run: julia --color=yes test/repl.jl
