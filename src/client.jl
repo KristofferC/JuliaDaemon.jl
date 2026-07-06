@@ -479,6 +479,8 @@ function cmd_list()
     printrow(r) = println(join([rpad(r[i], widths[i]) for i in 1:4], "  "), "  ", r[5])
     printrow(header)
     foreach(printrow, rows)
+    ndead = count(r -> r[2] == "dead", rows)
+    ndead > 0 && info("$ndead dead; `jld gc` removes their state (config, log, transcript)")
 end
 
 known_ids() = (root = cache_root(); isdir(root) ?
@@ -539,6 +541,25 @@ function ctx_for_eval_repl(flags)
     length(attached) > 1 &&
         die("multiple attached REPLs ($(join(attached, ", "))); run from the project or pass --project", 3)
     ctx_from_id(only(attached))
+end
+
+# Remove state directories (config, log, transcript) of dead daemons.
+function cmd_gc()
+    removed = 0
+    for id in known_ids()
+        dir = joinpath(cache_root(), id)
+        try_ping(dir) === nothing || continue  # running or unresponsive: keep
+        dt = read_toml(joinpath(dir, "daemon.toml"))
+        pid = dt === nothing ? nothing : get(dt, "pid", nothing)
+        pid !== nothing && pid_alive(pid) && continue
+        # No daemon.toml yet + fresh config: probably still starting up.
+        cfg = joinpath(dir, "config.toml")
+        dt === nothing && isfile(cfg) && time() - mtime(cfg) < 120 && continue
+        rm(dir; recursive=true, force=true)
+        info("removed $id")
+        removed += 1
+    end
+    removed == 0 && info("no dead daemons to remove")
 end
 
 function cmd_connect(ctx, flags)
@@ -673,6 +694,7 @@ commands:
   interrupt         interrupt the current eval at its next yield point; daemon survives
   status [--all]    daemon state for this project; all daemons if --all or outside a project
   list              list all daemons
+  gc                remove the state (config, log, transcript) of dead daemons
   connect [id]      attach an interactive REPL (RemoteREPL) to this project's daemon,
                     or to any daemon by id/prefix (see `jld list`); outside a project
                     with no id, connects to the single running daemon
@@ -749,6 +771,9 @@ function run_cli(args::Vector{String})
 
     if cmd == "list"
         cmd_list()
+        return
+    elseif cmd == "gc"
+        cmd_gc()
         return
     elseif cmd == "install"
         cmd_install()
