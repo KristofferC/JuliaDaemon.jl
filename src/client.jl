@@ -165,7 +165,7 @@ end
 
 function cmd_start(ctx, flags)
     if try_ping(ctx.dir) !== nothing
-        info("daemon already running (id $(ctx.id)); use `jld restart` to reload")
+        info("daemon already running (id $(ctx.id)); `jld restart` to reload, or `jld --name=<n> start` for an additional daemon on this project")
         return
     end
     mkpath(ctx.dir)
