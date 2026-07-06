@@ -492,8 +492,18 @@ function install_link(link, target)
 end
 
 function cmd_install()
-    install_link(joinpath(homedir(), ".claude", "skills", "julia-daemon"), joinpath(JLD_HOME, "skill"))
-    # Skip the bin symlink when jld is already reachable (e.g. Pkg app shim).
+    # Copy the skill rather than symlink: app-installed package directories
+    # are versioned and move on update, which would leave a dangling link.
+    src = joinpath(JLD_HOME, "skill")
+    dst = joinpath(homedir(), ".claude", "skills", "julia-daemon")
+    islink(dst) && rm(dst)
+    mkpath(dst)
+    for f in readdir(src)
+        cp(joinpath(src, f), joinpath(dst, f); force=true)
+    end
+    info("installed skill: $dst")
+    # A bin symlink is only needed when jld is not already reachable
+    # (the Pkg app shim in ~/.julia/bin makes this unnecessary).
     if Sys.which("jld") === nothing
         install_link(joinpath(homedir(), ".local", "bin", "jld"), joinpath(JLD_HOME, "bin", "jld"))
         bindir = joinpath(homedir(), ".local", "bin")
@@ -525,7 +535,7 @@ commands:
   connect           attach an interactive REPL (RemoteREPL) to the daemon
   logs [-f]         show daemon log
   setup             (re)install the daemon environment for the selected julia
-  install           symlink jld into ~/.local/bin and the skill into ~/.claude/skills
+  install           install the Claude Code skill (+ ~/.local/bin/jld symlink if jld is not on PATH)
 
 flags:
   --project=PATH    project to serve (default: JULIA_PROJECT or nearest Project.toml)

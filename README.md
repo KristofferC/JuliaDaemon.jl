@@ -57,11 +57,11 @@ As a Pkg app (julia 1.12+; puts the `jld` shim in `~/.julia/bin`, keep it on PAT
 
 ```
 pkg> app add <this repo url>
-$ jld install        # installs the Claude Code skill
+$ jld install        # copies the Claude Code skill into ~/.claude/skills
 ```
 
-Or from a clone: `JuliaDaemon.jl/bin/jld install` — installs the skill and,
-if `jld` is not already on PATH, a `~/.local/bin/jld` symlink.
+Or from a clone: `JuliaDaemon.jl/bin/jld install` — same, plus a
+`~/.local/bin/jld` symlink if `jld` is not already on PATH.
 
 Daemon dependencies (Revise, RemoteREPL) install themselves on first use.
 
