@@ -15,13 +15,6 @@ const HAVE_REVISE = try
 catch
     false
 end
-const HAVE_REMOTEREPL = try
-    @eval import RemoteREPL
-    true
-catch
-    false
-end
-
 include("protocol.jl")
 include("repl_input.jl")
 
@@ -69,6 +62,8 @@ struct Request
     cwd::String
     mod::String    # "" = Main; otherwise a module name under Main
     scratch::Bool  # evaluate in a throwaway module, release results after
+    client::String # "" (agent CLI) | "repl" (attached REPL)
+    color::Bool    # render results/errors with ANSI color
     sock::Any
     done::Ref{Bool}
     cancelled::Ref{Bool}
@@ -83,7 +78,6 @@ const STARTED = Ref(0.0)
 const EVAL_TASK = Ref{Task}()
 const STATE_DIR = Ref("")
 const NAME = Ref("")
-const REPL_PORT = Ref(0)
 
 # In-session introspection, e.g. `Main.JLDDaemon.id()` from an eval or the
 # attached REPL.
@@ -103,7 +97,7 @@ function collect_stacks()
     String(take!(iob))
 end
 
-# Soft interrupt, RemoteREPL-style: only lands when the eval task is at a
+# Soft interrupt: only lands when the eval task is at a
 # yield point. CPU-bound code that never yields cannot be interrupted this
 # way; `jld kill` is the fallback.
 function interrupt_eval()
@@ -147,6 +141,9 @@ function transcript_entry(source, input, output; status="ok", elapsed=nothing)
     hdr = string("#= ", Libc.strftime("%F %T", time()), " ", source, " (", status,
                  elapsed === nothing ? "" : string(", ", round(elapsed, digits=2), "s"), ") =#")
     input = trunc_middle(input, 4096, 1024)
+    # Keep the transcript readable for agents: no ANSI escapes (colored REPL
+    # results and errors flow through the same capture).
+    output = replace(output, r"\e\[[0-9;]*[A-Za-z]" => "")
     output = trunc_middle(output, CAP_HEAD, CAP_TAIL)
     body = isempty(strip(output)) ? "" : endswith(output, '\n') ? output : output * "\n"
     transcript_raw(string(hdr, "\njulia> ", input, "\n", body, "\n"))
@@ -164,71 +161,15 @@ function exprstring(ex)
     end
 end
 
-# Record the human REPL's activity by replacing RemoteREPL's (pinned) message
-# evaluator with an instrumented copy. Must run before serve_repl starts, so
-# its session tasks are created in a world that sees the replacement.
-function install_remoterepl_transcript()
-    if !(isdefined(RemoteREPL, :eval_message) &&
-         isdefined(RemoteREPL, :sprint_ctx) &&
-         isdefined(RemoteREPL, :preprocess_expression!) &&
-         length(methods(RemoteREPL.eval_message)) == 1)
-        logmsg("transcript: RemoteREPL internals changed; remote REPL input will not be recorded")
-        return
-    end
-    # Body copied from RemoteREPL/src/server.jl (MIT), plus the $entry calls.
-    entry = transcript_entry
-    exprstr = exprstring
-    @eval RemoteREPL function eval_message(session, messageid, messagebody)
-        input = messageid in (:eval, :eval_and_get) ? $exprstr(messagebody) : ""
-        t0 = time()
-        try
-            if messageid in (:eval, :eval_and_get)
-                result = nothing
-                resultstr = sprint_ctx(session) do io
-                    with_logger(ConsoleLogger(io)) do
-                        expr = preprocess_expression!(messagebody, io)
-                        result = Base.eval(session.in_module, expr)
-                        if messageid === :eval && !isnothing(result)
-                            Base.invokelatest(show, io, MIME"text/plain"(), result)
-                        end
-                    end
-                end
-                $entry("repl", input, resultstr; status="ok", elapsed=time() - t0)
-                return messageid === :eval ?
-                    (:eval_result, resultstr) :
-                    (:eval_and_get_result, (result, resultstr))
-            elseif messageid === :help
-                resultstr = sprint_ctx(session) do io
-                    md = Main.eval(REPL.helpmode(io, messagebody))
-                    Base.invokelatest(show, io, MIME"text/plain"(), md)
-                end
-                return (:help_result, resultstr)
-            elseif messageid === :display_properties
-                session.display_properties = messagebody::Dict
-                return nothing
-            elseif messageid === :in_module
-                mod = Main.eval(messagebody)::Module
-                session.in_module = mod
-                resultstr = "Evaluating commands in module $mod"
-                return (:in_module, resultstr)
-            elseif messageid === :repl_completion
-                partial, full = messagebody
-                ret, range, should_complete = REPL.completions(full, lastindex(partial),
-                                                               session.in_module)
-                result = (unique!(map(REPL.completion_text, ret)),
-                          partial[range], should_complete)
-                return (:completion_result, result)
-            else
-                return (:error, "Unknown message id: $messageid")
-            end
-        catch _
-            resultstr = sprint_ctx(session) do io
-                Base.invokelatest(Base.display_error, io, Base.catch_stack())
-            end
-            isempty(input) || $entry("repl", input, resultstr; status="error", elapsed=time() - t0)
-            return (:error, resultstr)
-        end
-    end
+# Tab completion for the attached REPL: computed against Main on the
+# interactive thread, over its own connection — never queued behind evals.
+function remote_completions(partial::AbstractString, full::AbstractString)
+    ret, range, should = REPL.completions(full, lastindex(partial), Main)
+    Dict{String,Any}(
+        "completions" => unique!(map(REPL.completion_text, ret)),
+        "partial" => partial[range],
+        "should" => should,
+    )
 end
 
 function main(args::Vector{String})
@@ -243,8 +184,8 @@ function main(args::Vector{String})
     end
     isempty(dir) && error("missing --dir")
 
-    # Pin logging (e.g. RemoteREPL's connection @infos) to the log file now;
-    # resolving `stderr` at log time would hit the per-request redirection.
+    # Pin logging to the log file now; resolving `stderr` at log time would
+    # hit the per-request redirection.
     Logging.global_logger(Logging.ConsoleLogger(stderr))
     # Same for the SIGUSR1/SIGINFO profile peek (`jld stacks`): its report must
     # land in the log even while a request has the streams redirected.
@@ -272,9 +213,16 @@ function main(args::Vector{String})
         run_startup(code) || (logmsg("startup code failed, exiting"); exit(1))
     end
 
-    logmsg("ready (pid $(Libc.getpid()), REPL port $(REPL_PORT[]))")
+    # Warm up the completion machinery so the attached REPL's first TAB is
+    # instant rather than a multi-second compile.
+    Threads.@spawn :default try
+        Base.invokelatest(remote_completions, "prin", "prin")
+    catch
+    end
+
+    logmsg("ready (pid $(Libc.getpid()))")
     # Evals run on the default pool; this (root) task and everything @async'd
-    # from it — accept loop, connection handlers, RemoteREPL — live on the
+    # from it — accept loop, connection handlers, completions — live on the
     # interactive thread, so ping/status/queueing/REPL stay responsive even
     # while an eval is compute-bound and never yields.
     EVAL_TASK[] = Threads.@spawn :default eval_loop(requests)
@@ -282,7 +230,7 @@ function main(args::Vector{String})
 end
 
 # Everything shared between spawned daemons and in-session servers: socket,
-# transcript, RemoteREPL, state file, accept loop. Returns the request
+# transcript, state file, accept loop. Returns the request
 # channel, or nothing if another daemon already serves this state dir.
 function setup_server(dir)
     STARTED[] = time()
@@ -302,9 +250,7 @@ function setup_server(dir)
                           SESSION[] ? " interactive session serving: project=" : " daemon started: project=",
                           something(Base.active_project(), "?"), ", julia ", VERSION,
                           ", pid ", Libc.getpid(), " =#\n\n"))
-    HAVE_REMOTEREPL && install_remoterepl_transcript()
-    REPL_PORT[] = HAVE_REMOTEREPL ? start_remoterepl() : 0
-    write_state(dir, REPL_PORT[])
+    write_state(dir)
 
     requests = Channel{Request}(32)
     @async accept_loop(server, requests)
@@ -318,8 +264,7 @@ cache_root() = joinpath(get(ENV, "XDG_CACHE_HOME", joinpath(homedir(), ".cache")
 
 Serve the current interactive julia session as a jld daemon: it appears in
 `jld list`, and agents can evaluate into it, read its transcript, inspect its
-stacks, and paste into its REPL. Revise and RemoteREPL are used if available
-in the session.
+stacks, and paste into its REPL. Revise is used if available in the session.
 """
 function serve_session(; name::AbstractString="repl")
     isempty(STATE_DIR[]) || error("this session is already serving as $(id())")
@@ -402,24 +347,9 @@ function listen_or_yield(sockpath)
     listen(sockpath)
 end
 
-function start_remoterepl()
-    port, server = listenany(Sockets.localhost, 27754)
-    @async begin
-        try
-            # invokelatest: the session tasks must be created in a world that
-            # sees the transcript override of RemoteREPL.eval_message.
-            Base.invokelatest(RemoteREPL.serve_repl, server)
-        catch e
-            e isa InterruptException || logmsg("RemoteREPL server died: $(sprint(showerror, e))")
-        end
-    end
-    Int(port)
-end
-
-function write_state(dir, repl_port)
+function write_state(dir)
     d = Dict{String,Any}(
         "pid" => Libc.getpid(),
-        "repl_port" => repl_port,
         "julia_version" => string(VERSION),
         "julia_bindir" => Sys.BINDIR,
         "project" => something(Base.active_project(), ""),
@@ -496,10 +426,25 @@ function handle_connection(conn, requests)
             write_frame(conn, "out", out)
             write_frame(conn, "done", "status = \"ok\"\n")
             close(conn)
+        elseif kind == "complete"
+            d = try
+                TOML.parse(payload)
+            catch
+                Dict{String,Any}()
+            end
+            reply = try
+                Base.invokelatest(remote_completions,
+                                  string(get(d, "partial", "")), string(get(d, "full", "")))
+            catch
+                Dict{String,Any}("completions" => String[], "partial" => "", "should" => false)
+            end
+            write_frame(conn, "completions", sprint(io -> TOML.print(io, reply)))
+            close(conn)
         elseif kind == "req"
             d = TOML.parse(payload)
             req = Request(d["kind"], d["code"], get(d, "cwd", ""),
                           get(d, "module", ""), get(d, "scratch", false),
+                          string(get(d, "client", "")), get(d, "color", false),
                           conn, Ref(false), Ref(false), Ref(false), ReentrantLock(), Capture())
             cur = CURRENT[]
             if cur !== nothing
@@ -642,7 +587,7 @@ function run_request(req)
         evalmod === Main && setglobal!(Base.MainInclude, :ans, result)
         if result !== nothing && req.kind == "eval" && !endswith(rstrip(req.code), ';')
             # invokelatest: rendering may hit methods/bindings defined by this request
-            resultstr = Base.invokelatest(render, result)
+            resultstr = Base.invokelatest(render, result, req.color)
         end
         result = nothing
     catch e
@@ -650,7 +595,7 @@ function run_request(req)
             status = "interrupted"
         else
             status = "error"
-            print(stderr, Base.invokelatest(format_error, e, catch_backtrace())::String)
+            print(stderr, Base.invokelatest(format_error, e, catch_backtrace(), req.color)::String)
         end
     finally
         try
@@ -686,7 +631,8 @@ function run_request(req)
             "include($(repr(req.code)))"
         end
     else
-        source = req.scratch ? "jld eval-scratch" : "jld eval"
+        source = req.client == "repl" ? "repl" :
+                 req.scratch ? "jld eval-scratch" : "jld eval"
         input = req.code
     end
     isempty(req.mod) || (source *= " in Main.$(req.mod)")
@@ -762,17 +708,18 @@ function revise_warnings()
     out
 end
 
-function render(x)
+function render(x, color::Bool=false)
     try
         sprint() do io
-            show(IOContext(io, :limit => true, :displaysize => (30, 120)), MIME"text/plain"(), x)
+            show(IOContext(io, :limit => true, :displaysize => (30, 120), :color => color),
+                 MIME"text/plain"(), x)
         end
     catch e
         "«error showing value of type $(typeof(x)): $(sprint(showerror, e))»"
     end
 end
 
-function format_error(e, bt)
+function format_error(e, bt, color::Bool=false)
     st = Base.stacktrace(bt)
     n = findfirst(fr -> String(fr.file) == @__FILE__, st)
     n !== nothing && (st = st[1:n-1])
@@ -781,7 +728,7 @@ function format_error(e, bt)
         pop!(st)
     end
     sprint() do io
-        ioc = IOContext(io, :limit => true)
+        ioc = IOContext(io, :limit => true, :color => color)
         print(ioc, "ERROR: ")
         showerror(ioc, e, st)
         println(ioc)

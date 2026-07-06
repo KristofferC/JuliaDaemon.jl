@@ -26,11 +26,13 @@ jld connect                            # attach your own REPL to the same sessio
 - Requests evaluate into `Main` with REPL soft-scope semantics; state (and
   `ans`) persists across calls. Evals are serialized; concurrent requests
   queue.
-- A RemoteREPL server runs in the same process. `jld connect` (or
-  `connect_repl(port)` from any Julia REPL of the same version) shares `Main`
-  with the agent: inspect what it built, and vice versa.
-- Interrupts are soft (`schedule(task, InterruptException())`, like
-  RemoteREPL): they land at yield points. A hot loop that never yields cannot
+- `jld connect` attaches an interactive REPL that shares `Main` with the
+  agent: inspect what it built, and vice versa. The remote prompt speaks the
+  same framed text protocol as everything else — no serialization, so any
+  julia version can attach to any daemon, and completions travel on their own
+  connection (answered by the daemon's control thread, even mid-eval).
+- Interrupts are soft (`schedule(task, InterruptException())`): they land at
+  yield points. A hot loop that never yields cannot
   be interrupted — `jld kill` it; the next eval autostarts a fresh daemon.
 
 ## Commands
@@ -53,18 +55,17 @@ julia> JuliaDaemon.serve()        # or serve(name="mysession")
 It appears in `jld list` (state `idle/repl`), and agents can `jld --id=<id>
 eval` into it, read its transcript (which includes your typed inputs),
 inspect its stacks, and `jld eval-repl` paste into your prompt. `jld stop` is
-refused for sessions — exit the REPL to end it. Revise and RemoteREPL are
-optional here and used when loadable in the session.
+refused for sessions — exit the REPL to end it. Revise is optional here and
+used when loadable in the session.
 
 ## Julia versions
 
 `--julia=BIN` (or `JLD_JULIA`) picks the daemon's julia — e.g. an in-tree
 `usr/bin/julia` build. Daemon dependencies are installed on first use into a
 named depot environment per minor version (`@jld-v1.12`, …), so the jld
-installation itself can be read-only. The wire protocol is plain text, so the `jld` CLI works
+installation itself can be read-only. The wire protocol is plain text, so the `jld` CLI and `jld connect` work
 against daemons of any version (handy when the dev build is broken mid-rebase:
-`status`/`logs`/`stop` still work). RemoteREPL attach does require the REPL's
-julia to match the daemon's.
+`status`/`logs`/`stop` still work).
 
 ## Install
 
@@ -81,7 +82,7 @@ of installed agents that only read their own (`~/.claude`, `~/.codex`).
 From a clone, `JuliaDaemon.jl/bin/jld install` also symlinks
 `~/.local/bin/jld` if `jld` is not already on PATH.
 
-Daemon dependencies (Revise, RemoteREPL) install themselves on first use.
+The daemon dependency (Revise) installs itself on first use.
 
 State lives in `~/.cache/julia-daemon/<id>/` (socket, config, log).
 Test: `test/e2e.sh`.

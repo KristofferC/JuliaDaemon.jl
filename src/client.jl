@@ -8,7 +8,7 @@ using SHA
 include(joinpath(@__DIR__, "protocol.jl"))
 
 const JLD_HOME = dirname(@__DIR__)
-const DAEMON_DEPS = ["Revise", "RemoteREPL"]
+const DAEMON_DEPS = ["Revise"]
 const SIGTERM_ = Cint(15)
 const SIGKILL_ = Cint(9)
 
@@ -204,7 +204,7 @@ function cmd_start(ctx, flags)
 
     jargs = ["--startup-file=no", "--project=$(ctx.project)"]
     # N default threads for evals + 1 interactive thread for the control plane
-    # (ping/status/queueing/RemoteREPL stay responsive during CPU-bound evals).
+    # (ping/status/queueing/the attached REPL stay responsive during CPU-bound evals).
     push!(jargs, "--threads=$(something(threads, "1")),1")
     dargs = ["--dir=$(ctx.dir)"]
     append!(dargs, ["--startup=$s" for s in startup])
@@ -449,6 +449,7 @@ function cmd_status(ctx)
             println("state:    unresponsive (pid $pid alive but not answering; still loading or wedged)")
         else
             println("state:    not running")
+            isempty(known_ids()) || info("`jld list` shows all daemons")
         end
         return
     end
@@ -458,7 +459,7 @@ function cmd_status(ctx)
     println("julia:    ", st["julia_version"])
     println("uptime:   ", round(st["uptime"] / 60, digits=1), " min")
     if dt !== nothing
-        println("REPL:     jld connect   (RemoteREPL on localhost:$(dt["repl_port"]))")
+        println("REPL:     jld connect")
     end
     isfile(joinpath(ctx.dir, "transcript.log")) &&
         println("history:  jld transcript   ($(joinpath(ctx.dir, "transcript.log")))")
@@ -480,11 +481,11 @@ function cmd_list()
         dt = read_toml(joinpath(dir, "daemon.toml"))
         pid = st isa Dict ? string(st["pid"]) :
               st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
-        port = dt !== nothing ? string(get(dt, "repl_port", "-")) : "-"
-        push!(rows, (id, state, pid, port, get(cfg, "project", "?")))
+        jver = dt !== nothing ? string(get(dt, "julia_version", "-")) : "-"
+        push!(rows, (id, state, pid, jver, get(cfg, "project", "?")))
     end
     isempty(rows) && (println("no daemons"); return)
-    header = ("ID", "STATE", "PID", "REPL", "PROJECT")
+    header = ("ID", "STATE", "PID", "JULIA", "PROJECT")
     widths = [maximum(length.([header[i], (r[i] for r in rows)...])) for i in 1:4]
     printrow(r) = println(join([rpad(r[i], widths[i]) for i in 1:4], "  "), "  ", r[5])
     printrow(header)
@@ -584,30 +585,23 @@ function cmd_connect(ctx, flags)
     st === :timeout && die("daemon is unresponsive (busy in a non-yielding eval?); it cannot accept a REPL until the eval yields or finishes — see `jld status`, or `jld kill` if stuck", 3)
     st === nothing && die("daemon not running; start it with `jld start`", 3)
     st["busy"] && info("note: daemon is busy (`$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s); the REPL shares the session and runs alongside it")
-    dt = daemon_toml(ctx)
-    port = dt["repl_port"]
-    port == 0 && die("$(ctx.id) has no RemoteREPL server" *
-        (get(dt, "kind", "") == "session" ? " — it is an interactive session; that REPL is the way in" : ""), 3)
-    dver = string(get(dt, "julia_version", "?"))
+    dt = something(daemon_toml(ctx), Dict{String,Any}())
+    sockpath = joinpath(ctx.dir, "sock")
     if get(flags, "print", false)
-        println("RemoteREPL server: localhost:$port (daemon julia $dver)")
-        println("From a Julia $dver REPL with RemoteREPL installed:")
-        println("  using RemoteREPL; connect_repl($port)")
+        println("daemon socket: $sockpath (framed text protocol; any julia can attach)")
+        println("attach with:   jld connect $(ctx.id)")
         return
     end
-    # Use the daemon's own julia binary: RemoteREPL requires matching versions.
+    # Prefer the daemon's own julia for the local prompt (not required — the
+    # protocol is plain text — it just keeps the two prompts consistent).
     julia = joinpath(string(get(dt, "julia_bindir", "")), "julia")
-    if !isfile(julia)
-        julia = ctx.julia
-        info("warning: daemon's julia binary not found, using $julia; RemoteREPL needs julia $dver")
-    end
-    envdir = ensure_env(julia, dver)
-    info("connecting to $(ctx.id) on port $port (press '>' for the remote prompt, backspace to leave it, Ctrl-D to exit)")
-    env = copy(ENV)
-    env["JULIA_LOAD_PATH"] = "@:$envdir:@stdlib"
+    isfile(julia) || (julia = ctx.julia)
+    # A session daemon owns repl.sock (eval-repl pastes go to *its* prompt);
+    # only spawned daemons hand it to the attached REPL.
+    inputsock = get(dt, "kind", "") == "session" ? "" : joinpath(ctx.dir, "repl.sock")
+    info("connecting to $(ctx.id) (backspace for the local julia> prompt, Ctrl-D to exit)")
     script = joinpath(JLD_HOME, "src", "connect_repl.jl")
-    inputsock = joinpath(ctx.dir, "repl.sock")
-    p = run(ignorestatus(setenv(`$julia --project=$(ctx.project) -i $script $port $inputsock`, env)))
+    p = run(ignorestatus(`$julia --project=$(ctx.project) -i $script $sockpath $inputsock $(ctx.id)`))
     exit(p.exitcode)
 end
 
@@ -720,10 +714,10 @@ commands:
   restart           restart (needed after struct redefinitions); keeps recorded --startup
   stop | kill       stop gracefully | SIGKILL
   interrupt         interrupt the current eval at its next yield point; daemon survives
-  status [--all]    daemon state for this project; all daemons if --all or outside a project
+  status [--all]    state of the daemon this context targets; --all lists all daemons
   list              list all daemons
   gc                remove the state (config, log, transcript) of dead daemons
-  connect [id]      attach an interactive REPL (RemoteREPL) to this project's daemon,
+  connect [id]      attach an interactive REPL to this project's daemon,
                     or to any daemon by id/prefix (see `jld list`); outside a project
                     with no id, connects to the single running daemon
   eval-repl '<code>'  paste code into the attached `jld connect` REPL, exactly as if
@@ -809,7 +803,7 @@ function run_cli(args::Vector{String})
         cmd_install()
         return
     elseif cmd == "status"
-        if !byid && (get(flags, "all", false) || outside_project())
+        if !byid && get(flags, "all", false)
             cmd_list()
         else
             cmd_status(resolve())
