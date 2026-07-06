@@ -469,6 +469,26 @@ function cmd_logs(ctx, flags)
     end
 end
 
+function install_link(link, target)
+    if islink(link)
+        readlink(link) == target && (info("already installed: $link"); return)
+        rm(link)
+    elseif ispath(link)
+        die("$link exists and is not a symlink; remove it first")
+    end
+    mkpath(dirname(link))
+    symlink(target, link)
+    info("installed $link -> $target")
+end
+
+function cmd_install()
+    install_link(joinpath(homedir(), ".local", "bin", "jld"), joinpath(JLD_HOME, "bin", "jld"))
+    install_link(joinpath(homedir(), ".claude", "skills", "julia-daemon"), joinpath(JLD_HOME, "skill"))
+    bindir = joinpath(homedir(), ".local", "bin")
+    any(p -> abspath(p) == bindir, split(get(ENV, "PATH", ""), ':')) ||
+        info("note: $bindir is not on PATH")
+end
+
 function cmd_setup(ctx)
     ver, julia = probe_julia(ctx.julia, ctx.project)
     ensure_env(julia, ver, force=true)
@@ -492,6 +512,7 @@ commands:
   connect           attach an interactive REPL (RemoteREPL) to the daemon
   logs [-f]         show daemon log
   setup             (re)install the daemon environment for the selected julia
+  install           symlink jld into ~/.local/bin and the skill into ~/.claude/skills
 
 flags:
   --project=PATH    project to serve (default: JULIA_PROJECT or nearest Project.toml)
@@ -546,6 +567,9 @@ function main()
     cmd = pos[1]
     if cmd == "list"
         cmd_list()
+        return
+    elseif cmd == "install"
+        cmd_install()
         return
     end
     ctx = make_ctx(flags)

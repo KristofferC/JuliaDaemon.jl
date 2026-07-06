@@ -15,7 +15,10 @@ checkout() { # checkout <desc> <needle> <haystack>
     if [[ "$3" == *"$2"* ]]; then echo "ok: $1"; else echo "FAIL: $1 (missing: $2)"; echo "$3"; FAILS=$((FAILS+1)); fi
 }
 
-cleanup() { "$JLD" --project="$WORK/ToyPkg" --name=$NAME kill >/dev/null 2>&1; rm -rf "$WORK"; }
+cleanup() {
+    "$JLD" --project="$WORK/ToyPkg" --name=$NAME kill >/dev/null 2>&1
+    rm -rf "$WORK" "${XDG_CACHE_HOME:-$HOME/.cache}"/julia-daemon/ToyPkg-$NAME-*
+}
 trap cleanup EXIT
 
 julia --startup-file=no -e "using Pkg; Pkg.generate(\"$WORK/ToyPkg\")" >/dev/null 2>&1

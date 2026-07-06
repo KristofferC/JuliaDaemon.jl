@@ -54,8 +54,12 @@ julia to match the daemon's.
 ## Install
 
 ```sh
-ln -s /path/to/JuliaDaemon.jl/bin/jld ~/.local/bin/jld
+git clone <this repo> && JuliaDaemon.jl/bin/jld install
 ```
+
+`install` symlinks `~/.local/bin/jld` and the Claude Code skill
+(`~/.claude/skills/julia-daemon`). Requires `julia` on PATH; daemon
+dependencies install themselves on first use.
 
 State lives in `~/.cache/julia-daemon/<id>/` (socket, config, log).
 Test: `test/e2e.sh`.
