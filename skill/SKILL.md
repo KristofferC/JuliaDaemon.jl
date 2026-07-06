@@ -45,10 +45,13 @@ survives. Pure CPU loops that never yield cannot be soft-interrupted:
 
 ```
 jld eval '<code>'   evaluate (stdin if no arg; heredocs work)   [autostarts]
+jld eval-scratch '<code>'  eval in a throwaway module that sees Main's bindings and
+                    keeps NOTHING — prefer for exploration so Main stays clean
 jld run <file.jl>   include a file                              [autostarts]
 jld start           pre-warm; --startup='using MyPkg' runs at boot
 jld restart         reload from scratch (keeps recorded --startup)
 jld status | list | logs [-f] | stop | kill | interrupt
+jld stacks          task backtraces of what the daemon is executing right now
 jld transcript      full session history (all inputs + outputs, incl. the human's
                     REPL) — read this first when joining an existing session
 jld connect [id]    attach an interactive human REPL (shares Main); id targets any daemon
@@ -56,7 +59,10 @@ jld eval-repl '<code>'  paste code into the human's attached REPL (echoed + eval
                     at whatever prompt is active there) — useful to show results
 ```
 
-Flags: `--project=PATH` (default: nearest Project.toml), `--name=N` /
-`JLD_NAME` (parallel daemons on one project — set this if another agent may
-share the directory), `--julia=BIN` / `JLD_JULIA` (daemon's julia, e.g. an
-in-tree build), `--timeout=SECS`.
+Flags: `--project=PATH` (default: nearest Project.toml, else the default
+environment like plain julia), `--name=N` / `JLD_NAME` (parallel daemons on
+one project — set this if another agent may share the directory),
+`--id=ID` (target any existing daemon from `jld list`, any command),
+`--module=M` (eval/run in module Main.M instead of Main),
+`--julia=BIN` / `JLD_JULIA` (daemon's julia, e.g. an in-tree build),
+`--timeout=SECS`.

@@ -3,6 +3,7 @@ module JLDDaemon
 using Sockets
 using TOML
 import Logging
+import Profile
 import REPL
 import Revise
 import RemoteREPL
@@ -51,6 +52,8 @@ struct Request
     kind::String   # "eval" | "include"
     code::String   # code string or absolute file path
     cwd::String
+    mod::String    # "" = Main; otherwise a module name under Main
+    scratch::Bool  # evaluate in a throwaway module, release results after
     sock::Any
     done::Ref{Bool}
     cancelled::Ref{Bool}
@@ -63,6 +66,17 @@ const CURRENT = Ref{Union{Request,Nothing}}(nothing)
 const CURRENT_T0 = Ref(0.0)
 const STARTED = Ref(0.0)
 const EVAL_TASK = Ref{Task}()
+
+# Runs on the interactive thread: profiling is process-wide, so this samples
+# whatever the eval thread is doing, even a non-yielding loop.
+function collect_stacks()
+    Profile.clear()
+    Profile.@profile sleep(0.7)
+    iob = IOBuffer()
+    Profile.print(IOContext(iob, :displaysize => (200, 240)); groupby = [:thread, :task], C = false)
+    Profile.clear()
+    String(take!(iob))
+end
 
 # Soft interrupt, RemoteREPL-style: only lands when the eval task is at a
 # yield point. CPU-bound code that never yields cannot be interrupted this
@@ -202,6 +216,20 @@ function main(args::Vector{String})
     # Pin logging (e.g. RemoteREPL's connection @infos) to the log file now;
     # resolving `stderr` at log time would hit the per-request redirection.
     Logging.global_logger(Logging.ConsoleLogger(stderr))
+    # Same for the SIGUSR1/SIGINFO profile peek (`jld stacks`): its report must
+    # land in the log even while a request has the streams redirected.
+    let logio = stderr
+        Profile.peek_report[] = function ()
+            iob = IOBuffer()
+            try
+                Profile.print(IOContext(iob, :displaysize => (200, 200)); groupby = [:thread, :task])
+            catch e
+                print(iob, "profile report failed: ", sprint(showerror, e), "\n")
+            end
+            write(logio, take!(iob))
+            flush(logio)
+        end
+    end
     logmsg("starting daemon, project = $(Base.active_project())")
 
     sockpath = joinpath(dir, "sock")
@@ -326,9 +354,19 @@ function handle_connection(conn, requests)
             ok = interrupt_eval()
             write_frame(conn, "done", "status = \"$(ok ? "ok" : "noop")\"\n")
             close(conn)
+        elseif kind == "stacks"
+            out = try
+                Base.invokelatest(collect_stacks)::String
+            catch e
+                "collecting stacks failed: " * sprint(showerror, e) * "\n"
+            end
+            write_frame(conn, "out", out)
+            write_frame(conn, "done", "status = \"ok\"\n")
+            close(conn)
         elseif kind == "req"
             d = TOML.parse(payload)
             req = Request(d["kind"], d["code"], get(d, "cwd", ""),
+                          get(d, "module", ""), get(d, "scratch", false),
                           conn, Ref(false), Ref(false), Ref(false), ReentrantLock(), Capture())
             cur = CURRENT[]
             if cur !== nothing
@@ -443,6 +481,7 @@ function run_request(req)
 
     status = "ok"
     resultstr = nothing
+    evalmod = nothing
     try
         try
             Revise.revise()
@@ -455,18 +494,22 @@ function run_request(req)
             safe_send(req, "warn", w)
         end
 
+        # invokelatest: these reflect over bindings created by earlier requests
+        evalmod = req.scratch ? Base.invokelatest(scratch_module) :
+                                Base.invokelatest(eval_module, req.mod)::Module
         result = withcwd(req.cwd) do
             if req.kind == "include"
-                Base.include(REPL.softscope, Main, req.code)
+                Base.include(REPL.softscope, evalmod, req.code)
             else
-                include_string(REPL.softscope, Main, req.code, "jld-eval")
+                include_string(REPL.softscope, evalmod, req.code, "jld-eval")
             end
         end
-        setglobal!(Base.MainInclude, :ans, result)
+        evalmod === Main && setglobal!(Base.MainInclude, :ans, result)
         if result !== nothing && req.kind == "eval" && !endswith(rstrip(req.code), ';')
             # invokelatest: rendering may hit methods/bindings defined by this request
             resultstr = Base.invokelatest(render, result)
         end
+        result = nothing
     catch e
         if is_interrupt(e)
             status = "interrupted"
@@ -487,6 +530,8 @@ function run_request(req)
         end
     end
 
+    req.scratch && evalmod isa Module && Base.invokelatest(scrub_module, evalmod)
+
     if resultstr !== nothing
         cap_write!(req.cap, endswith(resultstr, '\n') ? resultstr : resultstr * "\n")
         safe_send(req, "result", resultstr)
@@ -502,14 +547,64 @@ function run_request(req)
             "include($(repr(req.code)))"
         end
     else
-        source = "jld eval"
+        source = req.scratch ? "jld eval-scratch" : "jld eval"
         input = req.code
     end
+    isempty(req.mod) || (source *= " in Main.$(req.mod)")
     transcript_entry(source, rstrip(input), cap_string(req.cap); status, elapsed=time() - t0)
     logmsg("request finished: $status ($(round(time() - t0, digits=2))s) `$(first(req.code, 80))`")
 end
 
 withcwd(f, dir) = (isempty(dir) || !isdir(dir)) ? f() : cd(f, dir)
+
+# Get-or-create a named module under Main (a persistent workspace).
+function eval_module(name::AbstractString)
+    isempty(name) && return Main
+    Base.isidentifier(name) || error("--module must be a simple identifier, got \"$name\"")
+    s = Symbol(name)
+    if isdefined(Main, s)
+        m = getglobal(Main, s)
+        m isa Module || error("Main.$name exists and is not a module")
+        return m
+    end
+    Core.eval(Main, Expr(:module, true, s, Expr(:block)))
+end
+
+# Fresh throwaway module that can see Main: every current Main binding is
+# imported (aliases — they retain nothing beyond what Main already holds).
+function scratch_module()
+    m = Module(gensym("jld_scratch"))
+    Core.eval(m, :(eval(x) = Core.eval($m, x)))
+    Core.eval(m, :(include(f) = Base.include($m, f)))
+    for n in names(Main; all=true, imported=true)
+        (startswith(String(n), "#") || n in (:Main, :Base, :Core, :eval, :include)) && continue
+        isdefined(Main, n) || continue
+        try
+            Core.eval(m, Expr(:import, Expr(:(:), Expr(:., :Main), Expr(:., n))))
+        catch
+        end
+    end
+    m
+end
+
+# Release everything a scratch eval created, so no strong references are kept.
+# Imported aliases reject assignment and are skipped, which is exactly right.
+function scrub_module(m::Module)
+    for n in names(m; all=true)
+        startswith(String(n), "#") && continue
+        isdefined(m, n) || continue
+        v = getglobal(m, n)
+        (v === m || v === nothing) && continue
+        try
+            setglobal!(m, n, nothing)
+        catch
+            try
+                Core.eval(m, :(const $n = nothing))
+            catch
+            end
+        end
+    end
+end
 
 is_interrupt(e) = e isa InterruptException || (e isa LoadError && is_interrupt(e.error))
 

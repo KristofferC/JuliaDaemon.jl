@@ -62,6 +62,17 @@ out=$($J transcript 2>/dev/null)
 checkout "transcript records inputs" "scratch_result = sum(1:10)" "$out"
 checkout "transcript records outputs" "Hello World!" "$out"
 
+out=$($J --module=Wk eval 'wk_x = 7; wk_x' 2>/dev/null; $J eval 'Main.Wk.wk_x * 2, isdefined(Main, :wk_x)' 2>/dev/null)
+checkout "module workspace" "(14, false)" "$out"
+
+out=$($J eval 'sc_ref = 5;' 2>/dev/null; $J eval-scratch 'sc_tmp = sc_ref * 3' 2>/dev/null; $J eval 'isdefined(Main, :sc_tmp)' 2>/dev/null)
+checkout "eval-scratch sees Main, keeps nothing" "15
+false" "$out"
+
+out=$($J stacks 2>/dev/null)
+check "stacks" 0 $?
+checkout "stacks reports threads" "Thread" "$out"
+
 $J stop >/dev/null 2>&1
 $J --no-autostart eval '1' >/dev/null 2>&1
 check "stopped daemon unreachable" 3 $?

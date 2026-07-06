@@ -28,7 +28,7 @@ struct Ctx
     julia::String
 end
 
-function find_project(flag)
+function find_project(flag; default_env=false)
     p = flag !== nothing ? flag : get(ENV, "JULIA_PROJECT", nothing)
     if p !== nothing && !isempty(p)
         if startswith(p, "@") && p != "@."
@@ -50,14 +50,23 @@ function find_project(flag)
             return realpath(d)
         end
         nd = dirname(d)
-        nd == d && return nothing
+        if nd == d
+            default_env || return nothing
+            # No project anywhere upwards: fall back to the default
+            # environment, like plain `julia` does.
+            def = Base.load_path_expand("@v#.#")
+            def === nothing && return nothing
+            path = dirname(def)
+            mkpath(path)
+            return realpath(path)
+        end
         d = nd
     end
 end
 
 function make_ctx(flags)
-    project = find_project(get(flags, "project", nothing))
-    project === nothing && die("no Project.toml found upwards from $(pwd()); pass --project=<path> (or e.g. --project=@v1.12 for a default environment)")
+    project = find_project(get(flags, "project", nothing); default_env=true)
+    project === nothing && die("no project found and cannot resolve a default environment; pass --project=<path>")
     name = get(flags, "name", get(ENV, "JLD_NAME", ""))
     slug = replace(basename(project), r"[^A-Za-z0-9_.-]" => "-")
     h = bytes2hex(sha1(project * "\0" * name))[1:8]
@@ -264,7 +273,14 @@ function cmd_exec(ctx, kind, arg, flags)
     catch
         die("cannot connect to daemon socket; try `jld restart`", 3)
     end
-    req = Dict("kind" => kind, "code" => code, "cwd" => pwd())
+    req = Dict{String,Any}("kind" => kind, "code" => code, "cwd" => pwd())
+    m = get(flags, "module", "")
+    if !isempty(m)
+        Base.isidentifier(m) || die("--module must be a simple identifier, got \"$m\"")
+        get(flags, "scratch", false) && die("--module cannot be combined with eval-scratch")
+        req["module"] = m
+    end
+    get(flags, "scratch", false) && (req["scratch"] = true)
     write_frame(conn, "req", sprint(io -> TOML.print(io, req)))
     exit(stream_response(ctx, conn, flags))
 end
@@ -564,6 +580,34 @@ function cmd_logs(ctx, flags)
     end
 end
 
+# Ask the daemon's control thread to profile the process for ~1s and report
+# per-thread/task backtraces — shows what a busy daemon is doing.
+function cmd_stacks(ctx)
+    st = try_ping(ctx.dir)
+    st isa Dict || die(st === :timeout ?
+        "daemon unresponsive (started before thread support? `jld restart`)" :
+        "daemon not running", 3)
+    conn = try
+        connect(joinpath(ctx.dir, "sock"))
+    catch
+        die("cannot connect to daemon socket", 3)
+    end
+    write_frame(conn, "stacks")
+    info("sampling daemon for ~1s...")
+    got = false
+    while true
+        kind, payload = read_frame(conn)
+        if kind == "out"
+            got = !isempty(payload)
+            write(stdout, payload)
+        elseif kind == "done" || kind == "eof"
+            break
+        end
+    end
+    close(conn)
+    got || info("daemon returned no stacks (predates this feature? `jld restart`)")
+end
+
 function cmd_transcript(ctx, flags)
     path = joinpath(ctx.dir, "transcript.log")
     isfile(path) || die("no transcript for $(ctx.id) yet", 3)
@@ -620,6 +664,8 @@ usage: jld [flags] <command> [args]
 
 commands:
   eval '<code>'     evaluate code in the daemon (reads stdin if no arg); autostarts
+  eval-scratch '<code>'  like eval, but in a fresh module that sees Main's bindings;
+                    everything it creates is released afterwards (no state kept)
   run <file.jl>     include() a file in the daemon; autostarts
   start             start the daemon (pre-warm); --startup='using Foo' to run code at boot
   restart           restart (needed after struct redefinitions); keeps recorded --startup
@@ -635,13 +681,17 @@ commands:
   transcript [id] [-f]  print the session transcript: every input + output evaluated
                     in the daemon (jld eval/run and remote REPL), output truncated
                     per entry — lets an agent read the context of a running session
+  stacks [id]       show task backtraces of what the daemon is currently executing
   logs [-f]         show daemon log
   setup             (re)install the daemon environment for the selected julia
   install           install the Claude Code skill (+ ~/.local/bin/jld symlink if jld is not on PATH)
 
 flags:
-  --project=PATH    project to serve (default: JULIA_PROJECT or nearest Project.toml)
+  --project=PATH    project to serve (default: JULIA_PROJECT, nearest Project.toml,
+                    or the default environment — like plain julia)
   --name=NAME       distinct daemon for the same project (env: JLD_NAME)
+  --id=ID           target an existing daemon by id/prefix (see `jld list`), any command
+  --module=M        eval/run: evaluate in module Main.M instead of Main (created on demand)
   --julia=BIN       julia executable for the daemon (env: JLD_JULIA, default: julia)
   --startup=CODE    code to run at daemon boot (repeatable; with start/restart)
   --threads=N       daemon eval threads (default 1; +1 interactive thread is always
@@ -667,7 +717,7 @@ function parse_cli(args)
                 k, v = split(a[3:end], "=", limit=2)
                 if k == "startup"
                     push!(get!(Vector{String}, flags, "startup"), String(v))
-                elseif k in ("project", "name", "julia", "threads", "timeout")
+                elseif k in ("project", "name", "julia", "threads", "timeout", "module", "id")
                     flags[String(k)] = String(v)
                 else
                     die("unknown flag --$k")
@@ -691,6 +741,12 @@ function run_cli(args::Vector{String})
         return
     end
     cmd = pos[1]
+    # --id targets an existing daemon directly, bypassing project resolution.
+    byid = haskey(flags, "id")
+    resolve(posid=nothing) = byid ? ctx_from_id(flags["id"]) :
+                             posid !== nothing ? ctx_from_id(posid) : make_ctx(flags)
+    outside_project() = !byid && find_project(get(flags, "project", nothing)) === nothing
+
     if cmd == "list"
         cmd_list()
         return
@@ -698,38 +754,32 @@ function run_cli(args::Vector{String})
         cmd_install()
         return
     elseif cmd == "status"
-        if get(flags, "all", false) || find_project(get(flags, "project", nothing)) === nothing
+        if !byid && (get(flags, "all", false) || outside_project())
             cmd_list()
         else
-            cmd_status(make_ctx(flags))
+            cmd_status(resolve())
         end
         return
     elseif cmd == "connect"
-        ctx = if length(pos) >= 2
-            ctx_from_id(pos[2])
-        elseif find_project(get(flags, "project", nothing)) === nothing
-            ctx_from_only_running()
-        else
-            make_ctx(flags)
-        end
+        posid = length(pos) >= 2 ? pos[2] : nothing
+        ctx = posid === nothing && outside_project() ? ctx_from_only_running() : resolve(posid)
         cmd_connect(ctx, flags)
         return
     elseif cmd == "eval-repl"
-        cmd_eval_repl(ctx_for_eval_repl(flags), length(pos) >= 2 ? pos[2] : nothing)
+        ctx = byid ? ctx_from_id(flags["id"]) : ctx_for_eval_repl(flags)
+        cmd_eval_repl(ctx, length(pos) >= 2 ? pos[2] : nothing)
         return
-    elseif cmd == "transcript"
-        ctx = if length(pos) >= 2
-            ctx_from_id(pos[2])
-        elseif find_project(get(flags, "project", nothing)) === nothing
-            ctx_from_only_running()
-        else
-            make_ctx(flags)
-        end
-        cmd_transcript(ctx, flags)
+    elseif cmd == "transcript" || cmd == "stacks"
+        posid = length(pos) >= 2 ? pos[2] : nothing
+        ctx = posid === nothing && outside_project() ? ctx_from_only_running() : resolve(posid)
+        cmd == "transcript" ? cmd_transcript(ctx, flags) : cmd_stacks(ctx)
         return
     end
-    ctx = make_ctx(flags)
+    ctx = resolve()
     if cmd == "eval"
+        cmd_exec(ctx, "eval", length(pos) >= 2 ? pos[2] : nothing, flags)
+    elseif cmd == "eval-scratch"
+        flags["scratch"] = true
         cmd_exec(ctx, "eval", length(pos) >= 2 ? pos[2] : nothing, flags)
     elseif cmd == "run"
         cmd_exec(ctx, "include", length(pos) >= 2 ? pos[2] : nothing, flags)
