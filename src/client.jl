@@ -138,7 +138,7 @@ end
 # Returns the daemon state Dict, `:timeout` if the socket connects but the
 # daemon does not answer (wedged in a non-yielding eval), or nothing if not
 # running.
-function try_ping(dir; timeout=2.0)
+function try_ping(dir; timeout=5.0)
     dbg("ping: connecting to $(daemon_sock(dir))")
     conn = try
         connect(daemon_sock(dir))
@@ -678,7 +678,7 @@ end
 # Ask the daemon's control thread to profile the process for ~1s and report
 # per-thread/task backtraces — shows what a busy daemon is doing.
 function cmd_stacks(ctx)
-    st = try_ping(ctx.dir)
+    st = try_ping(ctx.dir; timeout=10.0)
     st isa Dict || die(st === :timeout ?
         "daemon unresponsive (started before thread support? `jld restart`)" :
         "daemon not running", 3)

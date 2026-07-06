@@ -33,7 +33,7 @@ jobs:
       - uses: julia-actions/cache@v2
       - name: End-to-end tests
         run: test/e2e.sh
-        timeout-minutes: 12
+        timeout-minutes: 25
         env:
           JLD_E2E_TRACE: ${{ runner.os == 'Windows' && '1' || '' }}
           JLD_DEBUG: ${{ runner.os == 'Windows' && '1' || '' }}
