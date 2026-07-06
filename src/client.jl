@@ -69,13 +69,23 @@ end
 
 # ---- daemon environment (per julia minor version) ----
 
+# Environment for julia subprocesses: drop LOAD_PATH/PROJECT overrides so the
+# default stack applies (the Pkg app shim pins JULIA_LOAD_PATH to the app env,
+# which has no @stdlib and would break `using Pkg` in children).
+function default_julia_env()
+    env = copy(ENV)
+    delete!(env, "JULIA_LOAD_PATH")
+    delete!(env, "JULIA_PROJECT")
+    env
+end
+
 # Resolve which julia actually runs for this project and where it lives.
 # The launcher (e.g. juliaup) may pick a channel based on the project's
 # manifest, so `julia --version` without the project can lie; probe with the
 # project and use the concrete binary from then on.
 function probe_julia(julia, project)
     out = try
-        readchomp(`$julia --startup-file=no --project=$project -e 'print(VERSION, "\0", Sys.BINDIR)'`)
+        readchomp(setenv(`$julia --startup-file=no --project=$project -e 'print(VERSION, "\0", Sys.BINDIR)'`, default_julia_env()))
     catch
         die("failed to run $julia")
     end
@@ -99,7 +109,7 @@ function ensure_env(julia, version; force=false)
         mkpath(envdir)
         info("setting up daemon environment @jld-v$minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
         code = "using Pkg; Pkg.add($(repr(DAEMON_DEPS)))"
-        run(pipeline(`$julia --startup-file=no --project=$envdir -e $code`, stdout=stderr, stderr=stderr))
+        run(pipeline(setenv(`$julia --startup-file=no --project=$envdir -e $code`, default_julia_env()), stdout=stderr, stderr=stderr))
     end
     envdir
 end
@@ -482,11 +492,14 @@ function install_link(link, target)
 end
 
 function cmd_install()
-    install_link(joinpath(homedir(), ".local", "bin", "jld"), joinpath(JLD_HOME, "bin", "jld"))
     install_link(joinpath(homedir(), ".claude", "skills", "julia-daemon"), joinpath(JLD_HOME, "skill"))
-    bindir = joinpath(homedir(), ".local", "bin")
-    any(p -> abspath(p) == bindir, split(get(ENV, "PATH", ""), ':')) ||
-        info("note: $bindir is not on PATH")
+    # Skip the bin symlink when jld is already reachable (e.g. Pkg app shim).
+    if Sys.which("jld") === nothing
+        install_link(joinpath(homedir(), ".local", "bin", "jld"), joinpath(JLD_HOME, "bin", "jld"))
+        bindir = joinpath(homedir(), ".local", "bin")
+        any(p -> abspath(p) == bindir, split(get(ENV, "PATH", ""), ':')) ||
+            info("note: $bindir is not on PATH")
+    end
 end
 
 function cmd_setup(ctx)
@@ -558,8 +571,8 @@ function parse_cli(args)
     (flags, pos)
 end
 
-function main()
-    flags, pos = parse_cli(ARGS)
+function run_cli(args::Vector{String})
+    flags, pos = parse_cli(args)
     if isempty(pos) || get(flags, "help", false) || (length(pos) == 1 && pos[1] == "help")
         print(HELP)
         return
@@ -600,4 +613,6 @@ function main()
     end
 end
 
-main()
+if abspath(PROGRAM_FILE) == @__FILE__
+    run_cli(ARGS)
+end

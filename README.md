@@ -53,13 +53,17 @@ julia to match the daemon's.
 
 ## Install
 
-```sh
-git clone <this repo> && JuliaDaemon.jl/bin/jld install
+As a Pkg app (julia 1.12+; puts the `jld` shim in `~/.julia/bin`, keep it on PATH):
+
+```
+pkg> app add <this repo url>
+$ jld install        # installs the Claude Code skill
 ```
 
-`install` symlinks `~/.local/bin/jld` and the Claude Code skill
-(`~/.claude/skills/julia-daemon`). Requires `julia` on PATH; daemon
-dependencies install themselves on first use.
+Or from a clone: `JuliaDaemon.jl/bin/jld install` — installs the skill and,
+if `jld` is not already on PATH, a `~/.local/bin/jld` symlink.
+
+Daemon dependencies (Revise, RemoteREPL) install themselves on first use.
 
 State lives in `~/.cache/julia-daemon/<id>/` (socket, config, log).
 Test: `test/e2e.sh`.
