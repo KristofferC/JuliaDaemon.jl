@@ -854,16 +854,32 @@ function run_cli(args::Vector{String})
         ctx = byid ? ctx_from_id(flags["id"]) : ctx_for_eval_repl(flags)
         cmd_eval_repl(ctx, length(pos) >= 2 ? pos[2] : nothing)
         return
-    elseif cmd == "transcript" || cmd == "stacks"
+    elseif cmd == "transcript" || cmd == "stacks" || cmd == "logs"
         posid = length(pos) >= 2 ? pos[2] : nothing
         ctx = if posid === nothing && outside_project()
             exists = cmd == "transcript" ? (c -> isfile(joinpath(c.dir, "transcript.log"))) :
-                                           (c -> try_ping(c.dir) !== nothing)
+                     cmd == "logs" ? (c -> isfile(log_path(c))) :
+                     (c -> try_ping(c.dir) !== nothing)
             ctx_from_only_running(flags, exists)
         else
             resolve(posid)
         end
-        cmd == "transcript" ? cmd_transcript(ctx, flags) : cmd_stacks(ctx)
+        cmd == "transcript" ? cmd_transcript(ctx, flags) :
+        cmd == "logs" ? cmd_logs(ctx, flags) : cmd_stacks(ctx)
+        return
+    elseif cmd in ("stop", "interrupt", "kill", "restart")
+        # Outside a project, act on the unique running daemon when the
+        # default-env identity has nothing to act on.
+        ctx = if outside_project()
+            exists = cmd == "restart" ? (c -> isfile(joinpath(c.dir, "config.toml"))) :
+                                        (c -> try_ping(c.dir) !== nothing)
+            ctx_from_only_running(flags, exists)
+        else
+            resolve()
+        end
+        cmd == "stop" ? cmd_stop(ctx) :
+        cmd == "interrupt" ? cmd_interrupt(ctx) :
+        cmd == "kill" ? cmd_kill(ctx) : cmd_restart(ctx, flags)
         return
     end
     ctx = resolve()
@@ -876,16 +892,6 @@ function run_cli(args::Vector{String})
         cmd_exec(ctx, "include", length(pos) >= 2 ? pos[2] : nothing, flags)
     elseif cmd == "start"
         cmd_start(ctx, flags)
-    elseif cmd == "stop"
-        cmd_stop(ctx)
-    elseif cmd == "kill"
-        cmd_kill(ctx)
-    elseif cmd == "restart"
-        cmd_restart(ctx, flags)
-    elseif cmd == "interrupt"
-        cmd_interrupt(ctx)
-    elseif cmd == "logs"
-        cmd_logs(ctx, flags)
     elseif cmd == "setup"
         cmd_setup(ctx)
     else
