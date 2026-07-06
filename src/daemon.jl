@@ -5,10 +5,25 @@ using TOML
 import Logging
 import Profile
 import REPL
-import Revise
-import RemoteREPL
+import SHA
+
+# Optional in session mode (`JuliaDaemon.serve()` in an existing REPL);
+# always present for spawned daemons via the stacked jld environment.
+const HAVE_REVISE = try
+    @eval import Revise
+    true
+catch
+    false
+end
+const HAVE_REMOTEREPL = try
+    @eval import RemoteREPL
+    true
+catch
+    false
+end
 
 include("protocol.jl")
+include("repl_input.jl")
 
 # Bounded output capture for the transcript: full head, ring-buffered tail.
 const CAP_HEAD = 12 * 1024
@@ -68,6 +83,7 @@ const STARTED = Ref(0.0)
 const EVAL_TASK = Ref{Task}()
 const STATE_DIR = Ref("")
 const NAME = Ref("")
+const REPL_PORT = Ref(0)
 
 # In-session introspection, e.g. `Main.JLDDaemon.id()` from an eval or the
 # attached REPL.
@@ -100,7 +116,13 @@ function interrupt_eval()
     end
 end
 
-logmsg(msg) = (println(stderr, "[jld ", Libc.strftime("%T", time()), "] ", msg); flush(stderr))
+# Spawned daemons log to stderr (redirected to the log file by the client);
+# session servers open the log file themselves. Captured once so per-request
+# stream redirection never leaks log lines into a client's output.
+const LOG_IO = Ref{IO}(stderr)
+const SESSION = Ref(false)
+
+logmsg(msg) = (println(LOG_IO[], "[jld ", Libc.strftime("%T", time()), "] ", msg); flush(LOG_IO[]))
 
 # ---- session transcript (input + output of everything evaluated in Main) ----
 
@@ -221,14 +243,6 @@ function main(args::Vector{String})
     end
     isempty(dir) && error("missing --dir")
 
-    STARTED[] = time()
-    STATE_DIR[] = dir
-    cfg = try
-        TOML.parsefile(joinpath(dir, "config.toml"))
-    catch
-        Dict{String,Any}()
-    end
-    NAME[] = string(get(cfg, "name", ""))
     # Pin logging (e.g. RemoteREPL's connection @infos) to the log file now;
     # resolving `stderr` at log time would hit the per-request redirection.
     Logging.global_logger(Logging.ConsoleLogger(stderr))
@@ -248,36 +262,128 @@ function main(args::Vector{String})
     end
     logmsg("starting daemon, project = $(Base.active_project())")
 
-    sockpath = joinpath(dir, "sock")
-    server = listen_or_yield(sockpath)
-    server === nothing && return
+    requests = setup_server(dir)
+    requests === nothing && return
 
-    TRANSCRIPT_PATH[] = joinpath(dir, "transcript.log")
-    transcript_raw(string("#= ", Libc.strftime("%F %T", time()), " daemon started: project=",
-                          something(Base.active_project(), "?"), ", julia ", VERSION,
-                          ", pid ", Libc.getpid(), " =#\n\n"))
-    install_remoterepl_transcript()
-
-    repl_port = start_remoterepl()
-    write_state(dir, repl_port)
-
-    Core.eval(Main, :(import Revise))
-
-    requests = Channel{Request}(32)
-    @async accept_loop(server, requests)
+    HAVE_REVISE && Core.eval(Main, :(import Revise))
 
     for code in startup
         logmsg("running startup code: $(first(code, 200))")
         run_startup(code) || (logmsg("startup code failed, exiting"); exit(1))
     end
 
-    logmsg("ready (pid $(Libc.getpid()), REPL port $repl_port)")
+    logmsg("ready (pid $(Libc.getpid()), REPL port $(REPL_PORT[]))")
     # Evals run on the default pool; this (root) task and everything @async'd
     # from it — accept loop, connection handlers, RemoteREPL — live on the
     # interactive thread, so ping/status/queueing/REPL stay responsive even
     # while an eval is compute-bound and never yields.
     EVAL_TASK[] = Threads.@spawn :default eval_loop(requests)
     wait(EVAL_TASK[])
+end
+
+# Everything shared between spawned daemons and in-session servers: socket,
+# transcript, RemoteREPL, state file, accept loop. Returns the request
+# channel, or nothing if another daemon already serves this state dir.
+function setup_server(dir)
+    STARTED[] = time()
+    STATE_DIR[] = dir
+    cfg = try
+        TOML.parsefile(joinpath(dir, "config.toml"))
+    catch
+        Dict{String,Any}()
+    end
+    NAME[] = string(get(cfg, "name", ""))
+
+    server = listen_or_yield(joinpath(dir, "sock"))
+    server === nothing && return nothing
+
+    TRANSCRIPT_PATH[] = joinpath(dir, "transcript.log")
+    transcript_raw(string("#= ", Libc.strftime("%F %T", time()),
+                          SESSION[] ? " interactive session serving: project=" : " daemon started: project=",
+                          something(Base.active_project(), "?"), ", julia ", VERSION,
+                          ", pid ", Libc.getpid(), " =#\n\n"))
+    HAVE_REMOTEREPL && install_remoterepl_transcript()
+    REPL_PORT[] = HAVE_REMOTEREPL ? start_remoterepl() : 0
+    write_state(dir, REPL_PORT[])
+
+    requests = Channel{Request}(32)
+    @async accept_loop(server, requests)
+    requests
+end
+
+cache_root() = joinpath(get(ENV, "XDG_CACHE_HOME", joinpath(homedir(), ".cache")), "julia-daemon")
+
+"""
+    serve_session(; name="repl")
+
+Serve the current interactive julia session as a jld daemon: it appears in
+`jld list`, and agents can evaluate into it, read its transcript, inspect its
+stacks, and paste into its REPL. Revise and RemoteREPL are used if available
+in the session.
+"""
+function serve_session(; name::AbstractString="repl")
+    isempty(STATE_DIR[]) || error("this session is already serving as $(id())")
+    proj = Base.active_project()
+    proj === nothing && error("no active project")
+    project = realpath(dirname(proj))
+    slug = replace(basename(project), r"[^A-Za-z0-9_.-]" => "-")
+    namesan = replace(name, r"[^A-Za-z0-9_.-]" => "-")
+    isempty(namesan) && error("name must be non-empty")
+    sid = string(slug, "-", namesan, "-", bytes2hex(SHA.sha1(project * "\0" * namesan))[1:8])
+    dir = joinpath(cache_root(), sid)
+    mkpath(dir)
+    open(joinpath(dir, "config.toml"), "w") do io
+        TOML.print(io, Dict{String,Any}(
+            "project" => project, "name" => namesan, "kind" => "session",
+            "julia" => joinpath(Sys.BINDIR, "julia"), "startup" => String[]))
+    end
+    LOG_IO[] = open(joinpath(dir, "daemon.log"), "a")
+    SESSION[] = true
+    requests = setup_server(dir)
+    if requests === nothing
+        SESSION[] = false
+        error("a daemon is already serving as $sid; pass a different name")
+    end
+    EVAL_TASK[] = Base.errormonitor(Threads.@spawn :default eval_loop(requests))
+    if isinteractive()
+        @async serve_input(joinpath(dir, "repl.sock"))  # `jld eval-repl` paste target
+        try
+            install_session_input_transcript()
+        catch e
+            logmsg("could not hook REPL input into the transcript: $(sprint(showerror, e))")
+        end
+    end
+    println("jld: serving this session as ", sid)
+    println("     agents: jld --id=$sid eval '<code>' | transcript | stacks | eval-repl")
+    HAVE_REVISE || println("     note: Revise is not loaded, source edits will not auto-apply")
+    sid
+end
+
+# Record the session's own REPL inputs in the transcript (their outputs render
+# through the REPL display path and are not captured). The REPL backend may
+# not exist yet when serve_session runs from -e or startup.jl — poll for it.
+function install_session_input_transcript()
+    @async begin
+        t0 = time()
+        while time() - t0 < 30
+            backend = isdefined(Base, :active_repl_backend) ? Base.active_repl_backend : nothing
+            if backend !== nothing
+                # First in the chain: record the raw input, not Revise's or
+                # softscope's wrapped version of it.
+                pushfirst!(backend.ast_transforms, function (ex)
+                    try
+                        transcript_entry("repl (this session)", exprstring(ex), ""; status="input")
+                    catch
+                    end
+                    return ex
+                end)
+                return
+            end
+            sleep(0.2)
+        end
+        logmsg("REPL backend never appeared; session inputs will not be recorded")
+    end
+    nothing
 end
 
 function listen_or_yield(sockpath)
@@ -318,6 +424,7 @@ function write_state(dir, repl_port)
         "julia_bindir" => Sys.BINDIR,
         "project" => something(Base.active_project(), ""),
         "started" => STARTED[],
+        "kind" => SESSION[] ? "session" : "daemon",
     )
     tmp = joinpath(dir, ".daemon.toml.tmp")
     open(tmp, "w") do io
@@ -337,6 +444,7 @@ function state_toml()
         "id" => id(),
         "name" => NAME[],
         "transcript" => TRANSCRIPT_PATH[],
+        "kind" => SESSION[] ? "session" : "daemon",
     )
     if cur !== nothing
         d["current"] = first(cur.code, 120)
@@ -365,10 +473,16 @@ function handle_connection(conn, requests)
             write_frame(conn, "pong", state_toml())
             close(conn)
         elseif kind == "shutdown"
-            logmsg("shutdown requested")
-            write_frame(conn, "done", "status = \"ok\"\n")
-            close(conn)
-            exit(0)
+            if SESSION[]
+                write_frame(conn, "warn", "this daemon is an interactive julia session; exit it from its REPL")
+                write_frame(conn, "done", "status = \"refused\"\n")
+                close(conn)
+            else
+                logmsg("shutdown requested")
+                write_frame(conn, "done", "status = \"ok\"\n")
+                close(conn)
+                exit(0)
+            end
         elseif kind == "interrupt"
             ok = interrupt_eval()
             write_frame(conn, "done", "status = \"$(ok ? "ok" : "noop")\"\n")
@@ -502,15 +616,17 @@ function run_request(req)
     resultstr = nothing
     evalmod = nothing
     try
-        try
-            Revise.revise()
-        catch e
-            is_interrupt(e) && rethrow()
-            safe_send(req, "warn", "Revise.revise() threw: $(sprint(showerror, e))")
-        end
-        for w in revise_warnings()
-            cap_write!(req.cap, "jld: " * w * "\n")
-            safe_send(req, "warn", w)
+        if HAVE_REVISE
+            try
+                Revise.revise()
+            catch e
+                is_interrupt(e) && rethrow()
+                safe_send(req, "warn", "Revise.revise() threw: $(sprint(showerror, e))")
+            end
+            for w in revise_warnings()
+                cap_write!(req.cap, "jld: " * w * "\n")
+                safe_send(req, "warn", w)
+            end
         end
 
         # invokelatest: these reflect over bindings created by earlier requests
@@ -556,6 +672,10 @@ function run_request(req)
         safe_send(req, "result", resultstr)
     end
     safe_send(req, "done", "status = \"$status\"\nelapsed = $(round(time() - t0, digits=3))\n")
+    # Mark done before the client reacts to the done frame: it closes its end
+    # immediately, and the request reader must not mistake that for a
+    # disconnect-during-eval and fire an interrupt.
+    req.done[] = true
     # For files, record the contents: scratch scripts get rewritten between
     # runs, so the path alone would lose the session history.
     if req.kind == "include"

@@ -370,7 +370,15 @@ function cmd_stop(ctx)
         try
             conn = connect(sockpath)
             write_frame(conn, "shutdown")
-            read_frame(conn)
+            while true
+                kind, payload = read_frame(conn)
+                kind == "warn" && (info(payload); continue)
+                if kind == "done" && contains(payload, "refused")
+                    close(conn)
+                    exit(2)
+                end
+                break
+            end
             close(conn)
             info("daemon stopped")
             return
@@ -465,8 +473,10 @@ function cmd_list()
         cfg = read_toml(joinpath(dir, "config.toml"))
         cfg === nothing && continue
         st = try_ping(dir)
+        session = (st isa Dict ? get(st, "kind", "") : get(cfg, "kind", "")) == "session"
         state = st isa Dict ? (st["busy"] ? "busy" : "idle") :
                 st === :timeout ? "unresponsive" : "dead"
+        session && (state *= "/repl")
         dt = read_toml(joinpath(dir, "daemon.toml"))
         pid = st isa Dict ? string(st["pid"]) :
               st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
@@ -576,6 +586,8 @@ function cmd_connect(ctx, flags)
     st["busy"] && info("note: daemon is busy (`$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s); the REPL shares the session and runs alongside it")
     dt = daemon_toml(ctx)
     port = dt["repl_port"]
+    port == 0 && die("$(ctx.id) has no RemoteREPL server" *
+        (get(dt, "kind", "") == "session" ? " — it is an interactive session; that REPL is the way in" : ""), 3)
     dver = string(get(dt, "julia_version", "?"))
     if get(flags, "print", false)
         println("RemoteREPL server: localhost:$port (daemon julia $dver)")

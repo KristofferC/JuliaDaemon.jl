@@ -24,6 +24,14 @@ are applied automatically before each request. Warm requests cost ~0.2s.
 - Exit codes are honest: 0 ok, 1 julia error (backtrace on stderr),
   3 daemon unreachable, 124 timeout, 130 interrupted.
 
+## Joining a human's live session
+
+A user's interactive REPL may itself be serving (state `idle/repl` in
+`jld list` — they ran `JuliaDaemon.serve()`). Join it with `--id=<id>`:
+read `jld transcript` first (it includes what they typed), eval into it,
+and show them results with `jld eval-repl`. NEVER `jld kill` a session —
+it is the user's live REPL (`jld stop` is refused automatically).
+
 ## Testing changes to a package
 
 1. Write a minimal scratch file with only the code under test

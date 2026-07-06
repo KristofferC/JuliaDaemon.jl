@@ -41,6 +41,21 @@ See `jld --help`. The essentials: `eval`, `run`, `start`, `restart`, `stop`,
 Exit codes: 0 ok, 1 julia error, 2 usage, 3 daemon unavailable, 124 timeout,
 130 interrupted.
 
+## Serving an existing session
+
+A running interactive session can itself become a daemon:
+
+```julia
+julia> using JuliaDaemon
+julia> JuliaDaemon.serve()        # or serve(name="mysession")
+```
+
+It appears in `jld list` (state `idle/repl`), and agents can `jld --id=<id>
+eval` into it, read its transcript (which includes your typed inputs),
+inspect its stacks, and `jld eval-repl` paste into your prompt. `jld stop` is
+refused for sessions — exit the REPL to end it. Revise and RemoteREPL are
+optional here and used when loadable in the session.
+
 ## Julia versions
 
 `--julia=BIN` (or `JLD_JULIA`) picks the daemon's julia — e.g. an in-tree

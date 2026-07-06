@@ -2,6 +2,24 @@ module JuliaDaemon
 
 include("client.jl")
 
+"""
+    JuliaDaemon.serve(; name="repl")
+
+Turn the current interactive julia session into a jld server: it appears in
+`jld list`, and agents can `jld --id=<id> eval` into it, read its transcript,
+inspect its stacks, and paste into its REPL with `jld eval-repl`. Uses Revise
+and RemoteREPL when they are loadable in this session.
+
+The daemon code is loaded on first call (into `Main.JLDDaemon`), keeping
+`using JuliaDaemon` itself lightweight.
+"""
+function serve(; name::AbstractString="repl")
+    if !isdefined(Main, :JLDDaemon)
+        Base.include(Main, joinpath(@__DIR__, "daemon.jl"))
+    end
+    Base.invokelatest(Main.JLDDaemon.serve_session; name)
+end
+
 function (@main)(args)
     cli_main(collect(String, args))
     return 0
