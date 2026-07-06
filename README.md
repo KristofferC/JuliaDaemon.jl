@@ -1,5 +1,7 @@
 # JuliaDaemon (`jld`)
 
+[![CI](https://github.com/KristofferC/JuliaDaemon.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/KristofferC/JuliaDaemon.jl/actions/workflows/ci.yml)
+
 Persistent, Revise-enabled Julia daemons — one per project — driveable from the
 command line. Built for agentic workflows: package load and compile latency is
 paid once, then each `jld eval`/`jld run` costs ~0.2s, streams output live,
