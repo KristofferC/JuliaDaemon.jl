@@ -229,6 +229,19 @@ function cmd_start(ctx, flags)
 
     cmd = `$julia $jargs $(joinpath(JLD_HOME, "src", "daemon_main.jl")) $dargs`
     dbg("start: spawning daemon")
+    # On Windows, CreateProcess(bInheritHandles=TRUE) copies every inheritable
+    # handle into the child. Our std handles may be a caller's capture pipe
+    # (e.g. bash $()); if the long-lived daemon inherits it, the caller never
+    # sees EOF and hangs. Mark them non-inheritable — explicit stdio
+    # redirection is unaffected (handles are duplicated on demand).
+    if Sys.iswindows()
+        for std in (0xfffffff6 % UInt32, 0xfffffff5 % UInt32, 0xfffffff4 % UInt32)  # -10, -11, -12
+            h = ccall((:GetStdHandle, "kernel32"), stdcall, Ptr{Cvoid}, (UInt32,), std)
+            h in (C_NULL, Ptr{Cvoid}(-1)) && continue
+            ccall((:SetHandleInformation, "kernel32"), stdcall, Cint,
+                  (Ptr{Cvoid}, UInt32, UInt32), h, UInt32(1), UInt32(0))
+        end
+    end
     proc = run(pipeline(detach(setenv(cmd, env)), stdin=devnull, stdout=logio, stderr=logio), wait=false)
     dbg("start: spawned, waiting for readiness")
     close(logio)

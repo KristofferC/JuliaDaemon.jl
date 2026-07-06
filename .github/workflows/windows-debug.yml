@@ -1,0 +1,40 @@
+# Temporary fast-iteration workflow while stabilizing Windows support.
+name: windows-debug
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v2
+      - name: Minimal daemon roundtrip
+        env:
+          JLD_DEBUG: '1'
+        run: |
+          set -x
+          WORK="$(cygpath -m "$(mktemp -d)")"
+          export XDG_CACHE_HOME="$WORK/cache"
+          julia --startup-file=no -e "using Pkg; Pkg.generate(\"$WORK/Toy\")"
+          cd "$WORK/Toy"
+          timeout 420 "$GITHUB_WORKSPACE/bin/jld" start || { echo "START FAILED/TIMED OUT"; exit 1; }
+          echo "=== start done, eval with capture ==="
+          out=$(timeout 120 "$GITHUB_WORKSPACE/bin/jld" eval '1+1' 2>&1)
+          echo "captured: $out"
+          echo "=== stop ==="
+          timeout 60 "$GITHUB_WORKSPACE/bin/jld" stop
+          echo "=== logs ==="
+          cat "$XDG_CACHE_HOME"/julia-daemon/*/daemon.log || true
