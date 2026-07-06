@@ -58,6 +58,10 @@ echo 'scratch_result = sum(1:10)' > "$WORK/scratch.jl"
 out=$($J run "$WORK/scratch.jl" 2>/dev/null; $J eval 'scratch_result' 2>/dev/null)
 checkout "run file + state persists" "55" "$out"
 
+out=$($J transcript 2>/dev/null)
+checkout "transcript records inputs" "scratch_result = sum(1:10)" "$out"
+checkout "transcript records outputs" "Hello World!" "$out"
+
 $J stop >/dev/null 2>&1
 $J --no-autostart eval '1' >/dev/null 2>&1
 check "stopped daemon unreachable" 3 $?

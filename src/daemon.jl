@@ -9,6 +9,44 @@ import RemoteREPL
 
 include("protocol.jl")
 
+# Bounded output capture for the transcript: full head, ring-buffered tail.
+const CAP_HEAD = 12 * 1024
+const CAP_TAIL = 4 * 1024
+
+mutable struct Capture
+    head::Vector{UInt8}
+    tail::Vector{UInt8}
+    tstart::Int
+    tcount::Int
+    total::Int
+end
+Capture() = Capture(UInt8[], zeros(UInt8, CAP_TAIL), 0, 0, 0)
+
+function cap_write!(c::Capture, data::AbstractVector{UInt8})
+    c.total += length(data)
+    i = 1
+    room = CAP_HEAD - length(c.head)
+    if room > 0
+        n = min(room, length(data))
+        append!(c.head, view(data, 1:n))
+        i = n + 1
+    end
+    while i <= length(data)
+        c.tail[(c.tstart + c.tcount) % CAP_TAIL + 1] = data[i]
+        c.tcount == CAP_TAIL ? (c.tstart = (c.tstart + 1) % CAP_TAIL) : (c.tcount += 1)
+        i += 1
+    end
+end
+cap_write!(c::Capture, s::AbstractString) = cap_write!(c, Vector{UInt8}(codeunits(s)))
+
+function cap_string(c::Capture)
+    tailbytes = UInt8[c.tail[(c.tstart + k) % CAP_TAIL + 1] for k in 0:c.tcount-1]
+    omitted = c.total - length(c.head) - c.tcount
+    head = String(copy(c.head))
+    omitted <= 0 && return head * String(tailbytes)
+    string(head, "\n⋯ jld: ", omitted, " bytes of output omitted ⋯\n", String(tailbytes))
+end
+
 struct Request
     kind::String   # "eval" | "include"
     code::String   # code string or absolute file path
@@ -18,6 +56,7 @@ struct Request
     cancelled::Ref{Bool}
     broken::Ref{Bool}
     sendlock::ReentrantLock
+    cap::Capture
 end
 
 const CURRENT = Ref{Union{Request,Nothing}}(nothing)
@@ -40,6 +79,113 @@ end
 
 logmsg(msg) = (println(stderr, "[jld ", Libc.strftime("%T", time()), "] ", msg); flush(stderr))
 
+# ---- session transcript (input + output of everything evaluated in Main) ----
+
+const TRANSCRIPT_PATH = Ref("")
+const TRANSCRIPT_LOCK = ReentrantLock()
+
+function transcript_raw(s::AbstractString)
+    isempty(TRANSCRIPT_PATH[]) && return
+    lock(TRANSCRIPT_LOCK) do
+        try
+            open(io -> write(io, s), TRANSCRIPT_PATH[], "a")
+        catch
+        end
+    end
+end
+
+trunc_middle(s, h, t) = sizeof(s) <= h + t + 64 ? s :
+    string(first(s, h), "\n⋯ jld: ", sizeof(s) - h - t, " bytes omitted ⋯\n", last(s, t))
+
+function transcript_entry(source, input, output; status="ok", elapsed=nothing)
+    isempty(TRANSCRIPT_PATH[]) && return
+    hdr = string("#= ", Libc.strftime("%F %T", time()), " ", source, " (", status,
+                 elapsed === nothing ? "" : string(", ", round(elapsed, digits=2), "s"), ") =#")
+    input = trunc_middle(input, 4096, 1024)
+    output = trunc_middle(output, CAP_HEAD, CAP_TAIL)
+    body = isempty(strip(output)) ? "" : endswith(output, '\n') ? output : output * "\n"
+    transcript_raw(string(hdr, "\njulia> ", input, "\n", body, "\n"))
+end
+
+function exprstring(ex)
+    try
+        if ex isa Expr && ex.head === :toplevel
+            join((string(a) for a in ex.args if !(a isa LineNumberNode)), "\n")
+        else
+            string(ex)
+        end
+    catch
+        "«unprintable expression»"
+    end
+end
+
+# Record the human REPL's activity by replacing RemoteREPL's (pinned) message
+# evaluator with an instrumented copy. Must run before serve_repl starts, so
+# its session tasks are created in a world that sees the replacement.
+function install_remoterepl_transcript()
+    if !(isdefined(RemoteREPL, :eval_message) &&
+         isdefined(RemoteREPL, :sprint_ctx) &&
+         isdefined(RemoteREPL, :preprocess_expression!) &&
+         length(methods(RemoteREPL.eval_message)) == 1)
+        logmsg("transcript: RemoteREPL internals changed; remote REPL input will not be recorded")
+        return
+    end
+    # Body copied from RemoteREPL/src/server.jl (MIT), plus the $entry calls.
+    entry = transcript_entry
+    exprstr = exprstring
+    @eval RemoteREPL function eval_message(session, messageid, messagebody)
+        input = messageid in (:eval, :eval_and_get) ? $exprstr(messagebody) : ""
+        t0 = time()
+        try
+            if messageid in (:eval, :eval_and_get)
+                result = nothing
+                resultstr = sprint_ctx(session) do io
+                    with_logger(ConsoleLogger(io)) do
+                        expr = preprocess_expression!(messagebody, io)
+                        result = Base.eval(session.in_module, expr)
+                        if messageid === :eval && !isnothing(result)
+                            Base.invokelatest(show, io, MIME"text/plain"(), result)
+                        end
+                    end
+                end
+                $entry("repl", input, resultstr; status="ok", elapsed=time() - t0)
+                return messageid === :eval ?
+                    (:eval_result, resultstr) :
+                    (:eval_and_get_result, (result, resultstr))
+            elseif messageid === :help
+                resultstr = sprint_ctx(session) do io
+                    md = Main.eval(REPL.helpmode(io, messagebody))
+                    Base.invokelatest(show, io, MIME"text/plain"(), md)
+                end
+                return (:help_result, resultstr)
+            elseif messageid === :display_properties
+                session.display_properties = messagebody::Dict
+                return nothing
+            elseif messageid === :in_module
+                mod = Main.eval(messagebody)::Module
+                session.in_module = mod
+                resultstr = "Evaluating commands in module $mod"
+                return (:in_module, resultstr)
+            elseif messageid === :repl_completion
+                partial, full = messagebody
+                ret, range, should_complete = REPL.completions(full, lastindex(partial),
+                                                               session.in_module)
+                result = (unique!(map(REPL.completion_text, ret)),
+                          partial[range], should_complete)
+                return (:completion_result, result)
+            else
+                return (:error, "Unknown message id: $messageid")
+            end
+        catch _
+            resultstr = sprint_ctx(session) do io
+                Base.invokelatest(Base.display_error, io, Base.catch_stack())
+            end
+            isempty(input) || $entry("repl", input, resultstr; status="error", elapsed=time() - t0)
+            return (:error, resultstr)
+        end
+    end
+end
+
 function main(args::Vector{String})
     dir = ""
     startup = String[]
@@ -61,6 +207,12 @@ function main(args::Vector{String})
     sockpath = joinpath(dir, "sock")
     server = listen_or_yield(sockpath)
     server === nothing && return
+
+    TRANSCRIPT_PATH[] = joinpath(dir, "transcript.log")
+    transcript_raw(string("#= ", Libc.strftime("%F %T", time()), " daemon started: project=",
+                          something(Base.active_project(), "?"), ", julia ", VERSION,
+                          ", pid ", Libc.getpid(), " =#\n\n"))
+    install_remoterepl_transcript()
 
     repl_port = start_remoterepl()
     write_state(dir, repl_port)
@@ -104,7 +256,9 @@ function start_remoterepl()
     port, server = listenany(Sockets.localhost, 27754)
     @async begin
         try
-            RemoteREPL.serve_repl(server)
+            # invokelatest: the session tasks must be created in a world that
+            # sees the transcript override of RemoteREPL.eval_message.
+            Base.invokelatest(RemoteREPL.serve_repl, server)
         catch e
             e isa InterruptException || logmsg("RemoteREPL server died: $(sprint(showerror, e))")
         end
@@ -175,7 +329,7 @@ function handle_connection(conn, requests)
         elseif kind == "req"
             d = TOML.parse(payload)
             req = Request(d["kind"], d["code"], get(d, "cwd", ""),
-                          conn, Ref(false), Ref(false), Ref(false), ReentrantLock())
+                          conn, Ref(false), Ref(false), Ref(false), ReentrantLock(), Capture())
             cur = CURRENT[]
             if cur !== nothing
                 write_frame(conn, "warn",
@@ -267,7 +421,9 @@ function pump(rd, kind, req)
     while true
         try
             eof(rd) && return
-            safe_send(req, kind, String(readavailable(rd)))
+            data = readavailable(rd)
+            cap_write!(req.cap, data)
+            safe_send(req, kind, String(data))
         catch e
             e isa InterruptException && continue
             return
@@ -295,6 +451,7 @@ function run_request(req)
             safe_send(req, "warn", "Revise.revise() threw: $(sprint(showerror, e))")
         end
         for w in revise_warnings()
+            cap_write!(req.cap, "jld: " * w * "\n")
             safe_send(req, "warn", w)
         end
 
@@ -330,8 +487,25 @@ function run_request(req)
         end
     end
 
-    resultstr !== nothing && safe_send(req, "result", resultstr)
+    if resultstr !== nothing
+        cap_write!(req.cap, endswith(resultstr, '\n') ? resultstr : resultstr * "\n")
+        safe_send(req, "result", resultstr)
+    end
     safe_send(req, "done", "status = \"$status\"\nelapsed = $(round(time() - t0, digits=3))\n")
+    # For files, record the contents: scratch scripts get rewritten between
+    # runs, so the path alone would lose the session history.
+    if req.kind == "include"
+        source = "jld run " * req.code
+        input = try
+            read(req.code, String)
+        catch
+            "include($(repr(req.code)))"
+        end
+    else
+        source = "jld eval"
+        input = req.code
+    end
+    transcript_entry(source, rstrip(input), cap_string(req.cap); status, elapsed=time() - t0)
     logmsg("request finished: $status ($(round(time() - t0, digits=2))s) `$(first(req.code, 80))`")
 end
 

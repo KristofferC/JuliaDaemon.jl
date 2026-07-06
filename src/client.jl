@@ -436,6 +436,8 @@ function cmd_status(ctx)
     if dt !== nothing
         println("REPL:     jld connect   (RemoteREPL on localhost:$(dt["repl_port"]))")
     end
+    isfile(joinpath(ctx.dir, "transcript.log")) &&
+        println("history:  jld transcript   ($(joinpath(ctx.dir, "transcript.log")))")
 end
 
 function cmd_list()
@@ -562,6 +564,16 @@ function cmd_logs(ctx, flags)
     end
 end
 
+function cmd_transcript(ctx, flags)
+    path = joinpath(ctx.dir, "transcript.log")
+    isfile(path) || die("no transcript for $(ctx.id) yet", 3)
+    if get(flags, "follow", false)
+        run(`tail -n 100 -f $path`)
+    else
+        write(stdout, read(path))
+    end
+end
+
 function install_link(link, target)
     if islink(link)
         readlink(link) == target && (info("already installed: $link"); return)
@@ -620,6 +632,9 @@ commands:
                     with no id, connects to the single running daemon
   eval-repl '<code>'  paste code into the attached `jld connect` REPL, exactly as if
                     typed there (echoed at the prompt, output shown, ans set)
+  transcript [id] [-f]  print the session transcript: every input + output evaluated
+                    in the daemon (jld eval/run and remote REPL), output truncated
+                    per entry — lets an agent read the context of a running session
   logs [-f]         show daemon log
   setup             (re)install the daemon environment for the selected julia
   install           install the Claude Code skill (+ ~/.local/bin/jld symlink if jld is not on PATH)
@@ -701,6 +716,10 @@ function run_cli(args::Vector{String})
         return
     elseif cmd == "eval-repl"
         cmd_eval_repl(ctx_for_eval_repl(flags), length(pos) >= 2 ? pos[2] : nothing)
+        return
+    elseif cmd == "transcript"
+        ctx = length(pos) >= 2 ? ctx_from_id(pos[2]) : make_ctx(flags)
+        cmd_transcript(ctx, flags)
         return
     end
     ctx = make_ctx(flags)

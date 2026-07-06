@@ -49,6 +49,8 @@ jld run <file.jl>   include a file                              [autostarts]
 jld start           pre-warm; --startup='using MyPkg' runs at boot
 jld restart         reload from scratch (keeps recorded --startup)
 jld status | list | logs [-f] | stop | kill | interrupt
+jld transcript      full session history (all inputs + outputs, incl. the human's
+                    REPL) — read this first when joining an existing session
 jld connect [id]    attach an interactive human REPL (shares Main); id targets any daemon
 jld eval-repl '<code>'  paste code into the human's attached REPL (echoed + evaluated
                     at whatever prompt is active there) — useful to show results
