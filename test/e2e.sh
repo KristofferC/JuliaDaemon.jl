@@ -85,7 +85,7 @@ check "timeout interrupt" 124 $?
 
 $J eval 'sleep(30)' >/dev/null 2>&1 &
 EVPID=$!
-sleep 2
+wait_busy
 $J interrupt >/dev/null 2>&1
 wait $EVPID
 check "jld interrupt aborts the eval" 130 $?
@@ -96,17 +96,16 @@ checkout "daemon state intact" "3" "$out"
 
 # ---- busy behavior ----
 
-$J eval 'sleep(3); "first"' >/dev/null 2>&1 &
-sleep 1
+$J eval 'sleep(8); "first"' >/dev/null 2>&1 &
+wait_busy
 out=$($J eval '"second"' 2>&1)
 check "queued eval succeeds" 0 $?
 checkout "queueing is reported" "queued" "$out"
 wait
 
-$J eval 'Libc.systemsleep(5)' >/dev/null 2>&1 &
-sleep 1.5
-out=$($J status 2>&8)
-checkout "status answers during CPU-bound eval" "busy" "$out"
+$J eval 'Libc.systemsleep(10)' >/dev/null 2>&1 &
+if wait_busy; then busyres="busy"; else busyres="never busy"; fi
+checkout "status answers during CPU-bound eval" "busy" "$busyres"
 wait
 
 # ---- files, modules, scratch ----
