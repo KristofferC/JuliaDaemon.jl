@@ -292,7 +292,7 @@ function serve_session(; name::AbstractString="repl")
             "julia" => joinpath(Sys.BINDIR, "julia"), "startup" => String[]))
     end
     atexit() do
-        Sys.iswindows() || rm(joinpath(dir, "sock"), force=true)
+        Sys.iswindows() || rm(daemon_sock(dir), force=true)
     end
     LOG_IO[] = open(joinpath(dir, "daemon.log"), "a")
     SESSION[] = true

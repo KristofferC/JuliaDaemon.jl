@@ -157,8 +157,8 @@ checkout "completion frame answers" "println" "$out"
 
 julia --startup-file=no --project="$WORK/ToyPkg" -e "
 include(\"$JLD_HOME/src/daemon.jl\")
-Main.JLDDaemon.serve_session(name=\"ci\")
 sess_var = 1234
+Main.JLDDaemon.serve_session(name=\"ci\")
 sleep(120)" > "$WORK/session.out" 2>&1 &
 SESSPID=$!
 for i in $(seq 1 120); do
@@ -167,8 +167,10 @@ for i in $(seq 1 120); do
 done
 out=$($JLD --id=ToyPkg-ci eval 'sess_var + 1' 2>/dev/null)
 checkout "eval into a served session" "1235" "$out"
-$JLD --id=ToyPkg-ci stop >/dev/null 2>&1
-check "stop refused for sessions" 2 $?
+stopout=$($JLD --id=ToyPkg-ci stop 2>&1)
+rc=$?
+check "stop refused for sessions" 2 $rc
+[ $rc -ne 2 ] && echo "stop said: $stopout"
 out=$($JLD --id=ToyPkg-ci eval '"session alive"' 2>/dev/null)
 checkout "session survived stop" "session alive" "$out"
 kill -9 $SESSPID >/dev/null 2>&1

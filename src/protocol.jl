@@ -11,8 +11,29 @@ const MAX_FRAME = 128 * 1024 * 1024
 
 # Rendezvous endpoints: unix domain sockets on posix; named pipes on Windows
 # (same Sockets API, but they live in the pipe namespace, not the filesystem).
-daemon_sock(dir) = Sys.iswindows() ? "\\\\.\\pipe\\jld-" * basename(dir) : joinpath(dir, "sock")
-input_sock(dir) = Sys.iswindows() ? "\\\\.\\pipe\\jld-" * basename(dir) * "-repl" : joinpath(dir, "repl.sock")
+# Unix socket paths are limited to ~104 bytes (macOS), so sockets live in a
+# short per-user runtime dir under a name derived from the state dir — never
+# inside the (arbitrarily deep) state dir itself.
+import SHA as JLD_SHA
+
+function sock_runtime_dir()
+    base = get(ENV, "XDG_RUNTIME_DIR", "")
+    if isempty(base) || !isdir(base)
+        uid = ccall(:getuid, Cuint, ())
+        base = joinpath(tempdir(), "jld-$uid")
+    else
+        base = joinpath(base, "jld")
+    end
+    isdir(base) || (mkpath(base); chmod(base, 0o700))
+    base
+end
+
+sock_tag(dir) = bytes2hex(JLD_SHA.sha1(abspath(dir)))[1:16]
+
+daemon_sock(dir) = Sys.iswindows() ? "\\\\.\\pipe\\jld-" * sock_tag(dir) :
+                   joinpath(sock_runtime_dir(), sock_tag(dir) * ".sock")
+input_sock(dir) = Sys.iswindows() ? "\\\\.\\pipe\\jld-" * sock_tag(dir) * "-r" :
+                  joinpath(sock_runtime_dir(), sock_tag(dir) * "-r.sock")
 
 # Whether something serves the endpoint right now (pipes have no fs entry, so
 # probing means connecting).

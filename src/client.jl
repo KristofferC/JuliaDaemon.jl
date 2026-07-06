@@ -186,7 +186,7 @@ function cmd_start(ctx, flags)
     mkpath(ctx.dir)
     chmod(dirname(ctx.dir), 0o700)
     chmod(ctx.dir, 0o700)  # the socket grants code execution as this user
-    Sys.iswindows() || rm(joinpath(ctx.dir, "sock"), force=true)
+    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
     rm(joinpath(ctx.dir, "daemon.toml"), force=true)
     ver, julia = probe_julia(ctx.julia, ctx.project)
     envdir = ensure_env(julia, ver)
@@ -209,7 +209,8 @@ function cmd_start(ctx, flags)
     flush(logio)
 
     env = copy(ENV)
-    env["JULIA_LOAD_PATH"] = "@:$envdir:@stdlib"
+    sep = Sys.iswindows() ? ";" : ":"
+    env["JULIA_LOAD_PATH"] = join(["@", envdir, "@stdlib"], sep)
     delete!(env, "JULIA_PROJECT")
 
     jargs = ["--startup-file=no", "--project=$(ctx.project)"]
@@ -383,11 +384,14 @@ function stream_response(ctx, conn, flags)
 end
 
 function cmd_stop(ctx)
+    handshake_err = nothing
+    got_any = false
     try
         conn = connect(daemon_sock(ctx.dir))
         write_frame(conn, "shutdown")
         while true
             kind, payload = read_frame(conn)
+            got_any = kind != "eof"
             kind == "warn" && (info(payload); continue)
             if kind == "done" && contains(payload, "refused")
                 close(conn)
@@ -396,10 +400,19 @@ function cmd_stop(ctx)
             break
         end
         close(conn)
-        info("daemon stopped")
-        return
-    catch
+        if got_any
+            info("daemon stopped")
+            return
+        end
+    catch e
+        handshake_err = e
     end
+    # Never escalate to signals against an interactive session: a transient
+    # handshake failure must not kill the user's REPL.
+    session = get(something(daemon_toml(ctx), Dict{String,Any}()), "kind", "") == "session"
+    handshake_err !== nothing &&
+        info("shutdown handshake failed: $(sprint(showerror, handshake_err))")
+    session && die("this daemon is an interactive session and did not confirm shutdown; not signaling it", 3)
     pid = daemon_pid(ctx)
     if pid !== nothing && pid_alive(pid)
         uv_kill(pid, SIGTERM_)
@@ -407,7 +420,7 @@ function cmd_stop(ctx)
     else
         info("daemon not running")
     end
-    Sys.iswindows() || rm(joinpath(ctx.dir, "sock"), force=true)
+    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
 end
 
 function cmd_kill(ctx)
@@ -418,7 +431,7 @@ function cmd_kill(ctx)
     else
         info("daemon not running")
     end
-    Sys.iswindows() || rm(joinpath(ctx.dir, "sock"), force=true)
+    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
 end
 
 function cmd_restart(ctx, flags)
