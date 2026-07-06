@@ -227,6 +227,7 @@ function cmd_start(ctx, flags)
     dargs = ["--dir=$(ctx.dir)"]
     append!(dargs, ["--startup=$s" for s in startup])
 
+    Sys.iswindows() && push!(dargs, "--log=$(log_path(ctx))")
     cmd = `$julia $jargs $(joinpath(JLD_HOME, "src", "daemon_main.jl")) $dargs`
     dbg("start: spawning daemon")
     # On Windows, CreateProcess(bInheritHandles=TRUE) copies every inheritable
@@ -242,7 +243,19 @@ function cmd_start(ctx, flags)
                   (Ptr{Cvoid}, UInt32, UInt32), h, UInt32(1), UInt32(0))
         end
     end
-    proc = run(pipeline(detach(setenv(cmd, env)), stdin=devnull, stdout=logio, stderr=logio), wait=false)
+    proc = if Sys.iswindows()
+        # Start-Process without redirections goes through ShellExecute: the
+        # daemon inherits environment but NO handles, so a caller's capture
+        # pipe can never leak into it. The daemon opens its own log (--log).
+        pesc(s) = "'" * replace(s, "'" => "''") * "'"
+        argl = join(map(pesc, vcat(jargs, [joinpath(JLD_HOME, "src", "daemon_main.jl")], dargs)), ",")
+        ps = "Start-Process -FilePath $(pesc(julia)) -ArgumentList @($argl) -WindowStyle Hidden"
+        run(pipeline(setenv(`powershell -NoProfile -NonInteractive -Command $ps`, env),
+                     stdin=devnull, stdout=devnull, stderr=devnull))
+        nothing
+    else
+        run(pipeline(detach(setenv(cmd, env)), stdin=devnull, stdout=logio, stderr=logio), wait=false)
+    end
     dbg("start: spawned, waiting for readiness")
     close(logio)
 
@@ -251,7 +264,7 @@ function cmd_start(ctx, flags)
     t0 = time()
     lastmsg = time()
     while time() - t0 < timeout
-        if process_exited(proc)
+        if proc !== nothing && process_exited(proc)
             info("daemon exited during startup; last log lines:")
             print(stderr, log_tail(ctx, 30))
             exit(1)
@@ -407,27 +420,31 @@ end
 
 function cmd_stop(ctx)
     handshake_err = nothing
-    got_any = false
-    try
-        conn = connect(daemon_sock(ctx.dir))
-        write_frame(conn, "shutdown")
-        while true
-            kind, payload = read_frame(conn)
-            got_any = kind != "eof"
-            kind == "warn" && (info(payload); continue)
-            if kind == "done" && contains(payload, "refused")
-                close(conn)
-                exit(2)
+    for attempt in 1:2
+        got_any = false
+        try
+            conn = connect(daemon_sock(ctx.dir))
+            write_frame(conn, "shutdown")
+            while true
+                kind, payload = read_frame(conn)
+                got_any = kind != "eof"
+                kind == "warn" && (info(payload); continue)
+                if kind == "done" && contains(payload, "refused")
+                    close(conn)
+                    exit(2)
+                end
+                break
             end
-            break
+            close(conn)
+            if got_any
+                info("daemon stopped")
+                return
+            end
+            handshake_err = nothing
+        catch e
+            handshake_err = e
         end
-        close(conn)
-        if got_any
-            info("daemon stopped")
-            return
-        end
-    catch e
-        handshake_err = e
+        attempt == 1 && sleep(0.2)
     end
     # Never escalate to signals against an interactive session: a transient
     # handshake failure must not kill the user's REPL.

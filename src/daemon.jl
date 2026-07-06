@@ -182,14 +182,26 @@ end
 function main(args::Vector{String})
     dir = ""
     startup = String[]
+    logfile = ""
     for a in args
         if startswith(a, "--dir=")
             dir = a[length("--dir=")+1:end]
         elseif startswith(a, "--startup=")
             push!(startup, a[length("--startup=")+1:end])
+        elseif startswith(a, "--log=")
+            logfile = a[length("--log=")+1:end]
         end
     end
     isempty(dir) && error("missing --dir")
+
+    # On Windows the daemon is spawned without any inherited stdio (handle
+    # inheritance leaks the caller's pipes); it opens its own log instead.
+    if !isempty(logfile)
+        logio = open(logfile, "a")
+        redirect_stdout(logio)
+        redirect_stderr(logio)
+        LOG_IO[] = logio
+    end
 
     # Pin logging to the log file now; resolving `stderr` at log time would
     # hit the per-request redirection.
