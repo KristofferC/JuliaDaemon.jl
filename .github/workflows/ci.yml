@@ -33,5 +33,8 @@ jobs:
       - uses: julia-actions/cache@v2
       - name: End-to-end tests
         run: test/e2e.sh
+        timeout-minutes: 12
+        env:
+          JLD_E2E_TRACE: ${{ runner.os == 'Windows' && '1' || '' }}
       - name: Remote REPL tests (pty)
         run: julia --color=yes test/repl.jl

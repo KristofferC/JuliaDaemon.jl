@@ -2,6 +2,7 @@
 # End-to-end test for jld. Requires a working `julia` on PATH (or JLD_JULIA).
 # Hermetic: daemon state lives in a temp XDG_CACHE_HOME.
 set -uo pipefail
+if [ -n "${JLD_E2E_TRACE:-}" ]; then set -x; fi
 
 JLD_HOME="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
 WORK="$(mktemp -d)"
