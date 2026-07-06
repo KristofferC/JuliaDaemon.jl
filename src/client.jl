@@ -69,23 +69,31 @@ end
 
 # ---- daemon environment (per julia minor version) ----
 
-function julia_version_of(julia)
+# Resolve which julia actually runs for this project and where it lives.
+# The launcher (e.g. juliaup) may pick a channel based on the project's
+# manifest, so `julia --version` without the project can lie; probe with the
+# project and use the concrete binary from then on.
+function probe_julia(julia, project)
     out = try
-        readchomp(`$julia --version`)
+        readchomp(`$julia --startup-file=no --project=$project -e 'print(VERSION, "\0", Sys.BINDIR)'`)
     catch
-        die("failed to run $julia --version")
+        die("failed to run $julia")
     end
-    m = match(r"(\d+)\.(\d+)\.", out)
-    m === nothing && die("cannot parse julia version from \"$out\"")
-    "$(m[1]).$(m[2])"
+    parts = split(out, '\0')
+    length(parts) == 2 || die("unexpected julia probe output: \"$out\"")
+    ver, bindir = String(parts[1]), String(parts[2])
+    bin = joinpath(bindir, "julia")
+    (ver, isfile(bin) ? bin : julia)
 end
 
-function ensure_env(julia; force=false)
-    ver = julia_version_of(julia)
-    envdir = joinpath(JLD_HOME, "envs", "v$ver")
+minor_of(ver) = (m = match(r"^(\d+)\.(\d+)\.", ver); m === nothing ? die("cannot parse julia version \"$ver\"") : "$(m[1]).$(m[2])")
+
+function ensure_env(julia, version; force=false)
+    minor = minor_of(version)
+    envdir = joinpath(JLD_HOME, "envs", "v$minor")
     if force || !isfile(joinpath(envdir, "Manifest.toml"))
         mkpath(envdir)
-        info("setting up daemon environment for Julia $ver (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
+        info("setting up daemon environment for Julia $minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
         code = "using Pkg; Pkg.add($(repr(DAEMON_DEPS)))"
         run(pipeline(`$julia --startup-file=no --project=$envdir -e $code`, stdout=stderr, stderr=stderr))
     end
@@ -141,12 +149,13 @@ function cmd_start(ctx, flags)
     mkpath(ctx.dir)
     rm(joinpath(ctx.dir, "sock"), force=true)
     rm(joinpath(ctx.dir, "daemon.toml"), force=true)
-    envdir = ensure_env(ctx.julia)
+    ver, julia = probe_julia(ctx.julia, ctx.project)
+    envdir = ensure_env(julia, ver)
 
     startup = get(flags, "startup", String[])
     threads = get(flags, "threads", nothing)
     cfg = Dict{String,Any}(
-        "project" => ctx.project, "name" => ctx.name, "julia" => ctx.julia,
+        "project" => ctx.project, "name" => ctx.name, "julia" => julia,
         "startup" => startup,
     )
     threads !== nothing && (cfg["threads"] = threads)
@@ -167,7 +176,7 @@ function cmd_start(ctx, flags)
     dargs = ["--dir=$(ctx.dir)"]
     append!(dargs, ["--startup=$s" for s in startup])
 
-    cmd = `$(ctx.julia) $jargs $(joinpath(JLD_HOME, "src", "daemon_main.jl")) $dargs`
+    cmd = `$julia $jargs $(joinpath(JLD_HOME, "src", "daemon_main.jl")) $dargs`
     proc = run(pipeline(detach(setenv(cmd, env)), stdin=devnull, stdout=logio, stderr=logio), wait=false)
     close(logio)
 
@@ -196,16 +205,22 @@ function cmd_start(ctx, flags)
     exit(1)
 end
 
+# Reuse options recorded by a previous `jld start` unless overridden now.
+function apply_cfg(ctx, flags, cfg)
+    cfg === nothing && return ctx
+    haskey(flags, "startup") || (flags["startup"] = get(cfg, "startup", String[]))
+    !haskey(flags, "threads") && haskey(cfg, "threads") && (flags["threads"] = cfg["threads"])
+    if !haskey(flags, "julia") && !haskey(ENV, "JLD_JULIA")
+        j = get(cfg, "julia", "")
+        isfile(j) && return Ctx(ctx.project, ctx.name, ctx.id, ctx.dir, j)
+    end
+    ctx
+end
+
 function ensure_running(ctx, flags)
     try_ping(ctx.dir) !== nothing && return
     get(flags, "no-autostart", false) && die("daemon not running (autostart disabled)", 3)
-    # Reuse recorded startup code/threads from a previous `jld start` if present.
-    cfg = config_toml(ctx)
-    if cfg !== nothing
-        haskey(flags, "startup") || (flags["startup"] = get(cfg, "startup", String[]))
-        !haskey(flags, "threads") && haskey(cfg, "threads") && (flags["threads"] = cfg["threads"])
-    end
-    cmd_start(ctx, flags)
+    cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
 end
 
 function cmd_exec(ctx, kind, arg, flags)
@@ -348,11 +363,7 @@ function cmd_restart(ctx, flags)
         end
         pid_alive(pid) && (uv_kill(pid, SIGKILL_); sleep(0.2))
     end
-    if cfg !== nothing
-        haskey(flags, "startup") || (flags["startup"] = get(cfg, "startup", String[]))
-        !haskey(flags, "threads") && haskey(cfg, "threads") && (flags["threads"] = cfg["threads"])
-    end
-    cmd_start(ctx, flags)
+    cmd_start(apply_cfg(ctx, flags, cfg), flags)
 end
 
 function cmd_interrupt(ctx)
@@ -423,21 +434,26 @@ function cmd_connect(ctx, flags)
     st === nothing && die("daemon not running; start it with `jld start`", 3)
     dt = daemon_toml(ctx)
     port = dt["repl_port"]
-    dver = get(dt, "julia_version", "?")
-    envdir = ensure_env(ctx.julia)
+    dver = string(get(dt, "julia_version", "?"))
     if get(flags, "print", false)
         println("RemoteREPL server: localhost:$port (daemon julia $dver)")
         println("From a Julia $dver REPL with RemoteREPL installed:")
         println("  using RemoteREPL; connect_repl($port)")
         return
     end
-    cver = julia_version_of(ctx.julia)
-    startswith(dver, cver) || info("warning: REPL julia $cver != daemon julia $dver; RemoteREPL may fail (pass --julia to match)")
-    info("connecting to $(ctx.id) on port $port (remote prompt: press '>', exit REPL with Ctrl-D)")
+    # Use the daemon's own julia binary: RemoteREPL requires matching versions.
+    julia = joinpath(string(get(dt, "julia_bindir", "")), "julia")
+    if !isfile(julia)
+        julia = ctx.julia
+        info("warning: daemon's julia binary not found, using $julia; RemoteREPL needs julia $dver")
+    end
+    envdir = ensure_env(julia, dver)
+    info("connecting to $(ctx.id) on port $port (press '>' for the remote prompt, backspace to leave it, Ctrl-D to exit)")
     env = copy(ENV)
     env["JULIA_LOAD_PATH"] = "@:$envdir:@stdlib"
-    code = "atreplinit(_ -> @async(begin sleep(0.1); import RemoteREPL; RemoteREPL.connect_repl($port) end))"
-    run(setenv(`$(ctx.julia) --project=$(ctx.project) -i -e $code`, env))
+    code = "import RemoteREPL; atreplinit(_ -> @async(begin sleep(0.25); RemoteREPL.connect_repl($port) end))"
+    p = run(ignorestatus(setenv(`$julia --project=$(ctx.project) -i -e $code`, env)))
+    exit(p.exitcode)
 end
 
 function cmd_logs(ctx, flags)
@@ -450,7 +466,8 @@ function cmd_logs(ctx, flags)
 end
 
 function cmd_setup(ctx)
-    ensure_env(ctx.julia, force=true)
+    ver, julia = probe_julia(ctx.julia, ctx.project)
+    ensure_env(julia, ver, force=true)
     info("daemon environment ready")
 end
 
