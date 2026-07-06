@@ -69,6 +69,15 @@ check "error exit code" 1 $?
 out=$($J eval 'sqrt(-1)' 2>&1)
 checkout "backtrace shown" "DomainError" "$out"
 
+# Wait until the daemon reports busy (a background eval has landed).
+wait_busy() {
+    for i in $(seq 1 80); do
+        [[ "$($J status 2>&8)" == *busy* ]] && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
 # ---- interrupts ----
 
 $J --timeout=2 eval 'sleep(60)' >/dev/null 2>&1
