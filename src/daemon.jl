@@ -116,7 +116,7 @@ end
 const LOG_IO = Ref{IO}(stderr)
 const SESSION = Ref(false)
 
-logmsg(msg) = (println(LOG_IO[], "[jld ", Libc.strftime("%T", time()), "] ", msg); flush(LOG_IO[]))
+logmsg(msg) = (println(LOG_IO[], "[jld ", Libc.strftime("%H:%M:%S", time()), "] ", msg); flush(LOG_IO[]))
 
 # ---- session transcript (input + output of everything evaluated in Main) ----
 
@@ -145,7 +145,7 @@ trunc_middle(s, h, t) = sizeof(s) <= h + t + 64 ? s :
 
 function transcript_entry(source, input, output; status="ok", elapsed=nothing)
     isempty(TRANSCRIPT_PATH[]) && return
-    hdr = string("#= ", Libc.strftime("%F %T", time()), " ", source, " (", status,
+    hdr = string("#= ", Libc.strftime("%Y-%m-%d %H:%M:%S", time()), " ", source, " (", status,
                  elapsed === nothing ? "" : string(", ", round(elapsed, digits=2), "s"), ") =#")
     input = trunc_middle(input, 4096, 1024)
     # Keep the transcript readable for agents: no ANSI escapes (colored REPL
@@ -253,7 +253,7 @@ function setup_server(dir)
     server === nothing && return nothing
 
     TRANSCRIPT_PATH[] = joinpath(dir, "transcript.log")
-    transcript_raw(string("#= ", Libc.strftime("%F %T", time()),
+    transcript_raw(string("#= ", Libc.strftime("%Y-%m-%d %H:%M:%S", time()),
                           SESSION[] ? " interactive session serving: project=" : " daemon started: project=",
                           something(Base.active_project(), "?"), ", julia ", VERSION,
                           ", pid ", Libc.getpid(), " =#\n\n"))

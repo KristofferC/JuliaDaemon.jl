@@ -13,7 +13,7 @@ const SIGTERM_ = Cint(15)
 const SIGKILL_ = Cint(9)
 
 info(msg) = println(stderr, "jld: ", msg)
-dbg(msg) = haskey(ENV, "JLD_DEBUG") && info("debug [$(Libc.strftime("%T", time()))]: " * msg)
+dbg(msg) = haskey(ENV, "JLD_DEBUG") && info("debug [$(Libc.strftime("%H:%M:%S", time()))]: " * msg)
 die(msg, code=2) = (info(msg); exit(code))
 
 uv_kill(pid, sig) = ccall(:uv_kill, Cint, (Cint, Cint), pid, sig)
@@ -212,7 +212,7 @@ function cmd_start(ctx, flags)
     mv(cfgtmp, joinpath(ctx.dir, "config.toml"), force=true)
 
     logio = open(log_path(ctx), "a")
-    println(logio, "=== jld daemon launch $(Libc.strftime("%F %T", time())) ===")
+    println(logio, "=== jld daemon launch $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
     flush(logio)
 
     env = copy(ENV)
