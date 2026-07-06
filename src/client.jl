@@ -504,12 +504,16 @@ function ctx_from_id(idarg)
     Ctx(get(cfg, "project", ""), get(cfg, "name", ""), id, dir, get(cfg, "julia", "julia"))
 end
 
-# With no project and no id: connect to the single running daemon, if unique.
-function ctx_from_only_running()
+# With no project and no id: prefer the daemon `jld eval` would target (the
+# default-environment identity) when it exists; otherwise the single running
+# daemon, if unique.
+function ctx_from_only_running(flags, exists::Function)
+    ctx = make_ctx(flags)
+    exists(ctx) && return ctx
     running = filter(id -> ping_alive(joinpath(cache_root(), id)), known_ids())
     isempty(running) && die("no running daemons", 3)
     if length(running) > 1
-        info("multiple daemons running; pick one with `jld connect <id>`:")
+        info("multiple daemons running; pick one with `--id=<id>`:")
         cmd_list()
         exit(2)
     end
@@ -533,13 +537,16 @@ function cmd_eval_repl(ctx, arg)
     kind == "done" || die("REPL did not acknowledge the paste", 3)
 end
 
-# eval-repl outside a project: target the unique attached REPL, if any.
+# eval-repl outside a project: the default-env daemon if a REPL is attached
+# to it, else the unique attached REPL.
 function ctx_for_eval_repl(flags)
     find_project(get(flags, "project", nothing)) !== nothing && return make_ctx(flags)
+    ctx = make_ctx(flags)
+    issocket(joinpath(ctx.dir, "repl.sock")) && return ctx
     attached = filter(id -> issocket(joinpath(cache_root(), id, "repl.sock")), known_ids())
     isempty(attached) && die("no attached REPL found; start one with `jld connect`", 3)
     length(attached) > 1 &&
-        die("multiple attached REPLs ($(join(attached, ", "))); run from the project or pass --project", 3)
+        die("multiple attached REPLs ($(join(attached, ", "))); pass --id", 3)
     ctx_from_id(only(attached))
 end
 
@@ -787,7 +794,8 @@ function run_cli(args::Vector{String})
         return
     elseif cmd == "connect"
         posid = length(pos) >= 2 ? pos[2] : nothing
-        ctx = posid === nothing && outside_project() ? ctx_from_only_running() : resolve(posid)
+        ctx = posid === nothing && outside_project() ?
+              ctx_from_only_running(flags, c -> try_ping(c.dir) !== nothing) : resolve(posid)
         cmd_connect(ctx, flags)
         return
     elseif cmd == "eval-repl"
@@ -796,7 +804,13 @@ function run_cli(args::Vector{String})
         return
     elseif cmd == "transcript" || cmd == "stacks"
         posid = length(pos) >= 2 ? pos[2] : nothing
-        ctx = posid === nothing && outside_project() ? ctx_from_only_running() : resolve(posid)
+        ctx = if posid === nothing && outside_project()
+            exists = cmd == "transcript" ? (c -> isfile(joinpath(c.dir, "transcript.log"))) :
+                                           (c -> try_ping(c.dir) !== nothing)
+            ctx_from_only_running(flags, exists)
+        else
+            resolve(posid)
+        end
         cmd == "transcript" ? cmd_transcript(ctx, flags) : cmd_stacks(ctx)
         return
     end

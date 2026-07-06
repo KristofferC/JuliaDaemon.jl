@@ -66,6 +66,15 @@ const CURRENT = Ref{Union{Request,Nothing}}(nothing)
 const CURRENT_T0 = Ref(0.0)
 const STARTED = Ref(0.0)
 const EVAL_TASK = Ref{Task}()
+const STATE_DIR = Ref("")
+const NAME = Ref("")
+
+# In-session introspection, e.g. `Main.JLDDaemon.id()` from an eval or the
+# attached REPL.
+id() = basename(STATE_DIR[])
+name() = NAME[]
+statedir() = STATE_DIR[]
+transcript_path() = TRANSCRIPT_PATH[]
 
 # Runs on the interactive thread: profiling is process-wide, so this samples
 # whatever the eval thread is doing, even a non-yielding loop.
@@ -213,6 +222,13 @@ function main(args::Vector{String})
     isempty(dir) && error("missing --dir")
 
     STARTED[] = time()
+    STATE_DIR[] = dir
+    cfg = try
+        TOML.parsefile(joinpath(dir, "config.toml"))
+    catch
+        Dict{String,Any}()
+    end
+    NAME[] = string(get(cfg, "name", ""))
     # Pin logging (e.g. RemoteREPL's connection @infos) to the log file now;
     # resolving `stderr` at log time would hit the per-request redirection.
     Logging.global_logger(Logging.ConsoleLogger(stderr))
@@ -318,6 +334,9 @@ function state_toml()
         "uptime" => round(time() - STARTED[], digits=1),
         "julia_version" => string(VERSION),
         "project" => something(Base.active_project(), ""),
+        "id" => id(),
+        "name" => NAME[],
+        "transcript" => TRANSCRIPT_PATH[],
     )
     if cur !== nothing
         d["current"] = first(cur.code, 120)
