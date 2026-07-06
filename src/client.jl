@@ -57,7 +57,7 @@ end
 
 function make_ctx(flags)
     project = find_project(get(flags, "project", nothing))
-    project === nothing && die("no Project.toml found upwards from $(pwd()); pass --project=<path>")
+    project === nothing && die("no Project.toml found upwards from $(pwd()); pass --project=<path> (or e.g. --project=@v1.12 for a default environment)")
     name = get(flags, "name", get(ENV, "JLD_NAME", ""))
     slug = replace(basename(project), r"[^A-Za-z0-9_.-]" => "-")
     h = bytes2hex(sha1(project * "\0" * name))[1:8]
