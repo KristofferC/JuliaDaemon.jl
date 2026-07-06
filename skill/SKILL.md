@@ -49,7 +49,7 @@ jld run <file.jl>   include a file                              [autostarts]
 jld start           pre-warm; --startup='using MyPkg' runs at boot
 jld restart         reload from scratch (keeps recorded --startup)
 jld status | list | logs [-f] | stop | kill | interrupt
-jld connect         attach an interactive human REPL (shares Main)
+jld connect [id]    attach an interactive human REPL (shares Main); id targets any daemon
 ```
 
 Flags: `--project=PATH` (default: nearest Project.toml), `--name=N` /

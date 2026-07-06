@@ -50,13 +50,14 @@ function find_project(flag)
             return realpath(d)
         end
         nd = dirname(d)
-        nd == d && die("no Project.toml found upwards from $(pwd()); pass --project=<path>")
+        nd == d && return nothing
         d = nd
     end
 end
 
 function make_ctx(flags)
     project = find_project(get(flags, "project", nothing))
+    project === nothing && die("no Project.toml found upwards from $(pwd()); pass --project=<path>")
     name = get(flags, "name", get(ENV, "JLD_NAME", ""))
     slug = replace(basename(project), r"[^A-Za-z0-9_.-]" => "-")
     h = bytes2hex(sha1(project * "\0" * name))[1:8]
@@ -443,6 +444,39 @@ function cmd_list()
     foreach(printrow, rows)
 end
 
+known_ids() = (root = cache_root(); isdir(root) ?
+    filter(d -> isfile(joinpath(root, d, "config.toml")), sort(readdir(root))) : String[])
+
+function ctx_from_id(idarg)
+    ids = known_ids()
+    matches = filter(d -> d == idarg || startswith(d, idarg), ids)
+    isempty(matches) && die("no daemon matching \"$idarg\" (see `jld list`)", 3)
+    if length(matches) > 1 && !(idarg in matches)
+        # Prefer a unique running daemon over dead prefix-siblings.
+        running = filter(id -> try_ping(joinpath(cache_root(), id)) !== nothing, matches)
+        length(running) == 1 ||
+            die("ambiguous id \"$idarg\": matches $(join(matches, ", "))")
+        matches = running
+    end
+    id = idarg in matches ? idarg : only(matches)
+    dir = joinpath(cache_root(), id)
+    cfg = read_toml(joinpath(dir, "config.toml"))
+    cfg === nothing && die("unreadable daemon state in $dir")
+    Ctx(get(cfg, "project", ""), get(cfg, "name", ""), id, dir, get(cfg, "julia", "julia"))
+end
+
+# With no project and no id: connect to the single running daemon, if unique.
+function ctx_from_only_running()
+    running = filter(id -> try_ping(joinpath(cache_root(), id)) !== nothing, known_ids())
+    isempty(running) && die("no running daemons", 3)
+    if length(running) > 1
+        info("multiple daemons running; pick one with `jld connect <id>`:")
+        cmd_list()
+        exit(2)
+    end
+    ctx_from_id(only(running))
+end
+
 function cmd_connect(ctx, flags)
     st = try_ping(ctx.dir)
     st === nothing && die("daemon not running; start it with `jld start`", 3)
@@ -530,9 +564,11 @@ commands:
   restart           restart (needed after struct redefinitions); keeps recorded --startup
   stop | kill       stop gracefully | SIGKILL
   interrupt         send SIGINT to interrupt the current eval, daemon survives
-  status            show daemon state for this project
+  status [--all]    daemon state for this project; all daemons if --all or outside a project
   list              list all daemons
-  connect           attach an interactive REPL (RemoteREPL) to the daemon
+  connect [id]      attach an interactive REPL (RemoteREPL) to this project's daemon,
+                    or to any daemon by id/prefix (see `jld list`); outside a project
+                    with no id, connects to the single running daemon
   logs [-f]         show daemon log
   setup             (re)install the daemon environment for the selected julia
   install           install the Claude Code skill (+ ~/.local/bin/jld symlink if jld is not on PATH)
@@ -571,7 +607,7 @@ function parse_cli(args)
                 end
             else
                 k = a[3:end]
-                k in ("no-autostart", "print", "follow", "help") || die("unknown flag --$k")
+                k in ("no-autostart", "print", "follow", "help", "all") || die("unknown flag --$k")
                 flags[k] = true
             end
         else
@@ -594,6 +630,23 @@ function run_cli(args::Vector{String})
     elseif cmd == "install"
         cmd_install()
         return
+    elseif cmd == "status"
+        if get(flags, "all", false) || find_project(get(flags, "project", nothing)) === nothing
+            cmd_list()
+        else
+            cmd_status(make_ctx(flags))
+        end
+        return
+    elseif cmd == "connect"
+        ctx = if length(pos) >= 2
+            ctx_from_id(pos[2])
+        elseif find_project(get(flags, "project", nothing)) === nothing
+            ctx_from_only_running()
+        else
+            make_ctx(flags)
+        end
+        cmd_connect(ctx, flags)
+        return
     end
     ctx = make_ctx(flags)
     if cmd == "eval"
@@ -610,10 +663,6 @@ function run_cli(args::Vector{String})
         cmd_restart(ctx, flags)
     elseif cmd == "interrupt"
         cmd_interrupt(ctx)
-    elseif cmd == "status"
-        cmd_status(ctx)
-    elseif cmd == "connect"
-        cmd_connect(ctx, flags)
     elseif cmd == "logs"
         cmd_logs(ctx, flags)
     elseif cmd == "setup"
@@ -623,6 +672,16 @@ function run_cli(args::Vector{String})
     end
 end
 
+# Exit quietly when stdout goes away mid-write (e.g. `jld list | head`).
+function cli_main(args)
+    try
+        run_cli(args)
+    catch e
+        e isa Base.IOError && occursin("EPIPE", e.msg) && exit(0)
+        rethrow()
+    end
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
-    run_cli(ARGS)
+    cli_main(ARGS)
 end
