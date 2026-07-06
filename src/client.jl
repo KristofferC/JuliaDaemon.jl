@@ -13,6 +13,7 @@ const SIGTERM_ = Cint(15)
 const SIGKILL_ = Cint(9)
 
 info(msg) = println(stderr, "jld: ", msg)
+dbg(msg) = haskey(ENV, "JLD_DEBUG") && info("debug [$(Libc.strftime("%T", time()))]: " * msg)
 die(msg, code=2) = (info(msg); exit(code))
 
 uv_kill(pid, sig) = ccall(:uv_kill, Cint, (Cint, Cint), pid, sig)
@@ -138,11 +139,14 @@ end
 # daemon does not answer (wedged in a non-yielding eval), or nothing if not
 # running.
 function try_ping(dir; timeout=2.0)
+    dbg("ping: connecting to $(daemon_sock(dir))")
     conn = try
         connect(daemon_sock(dir))
     catch
+        dbg("ping: no listener")
         return nothing
     end
+    dbg("ping: connected")
     try
         write_frame(conn, "ping")
         t = @async read_frame(conn)
@@ -188,8 +192,11 @@ function cmd_start(ctx, flags)
     chmod(ctx.dir, 0o700)  # the socket grants code execution as this user
     Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
     rm(joinpath(ctx.dir, "daemon.toml"), force=true)
+    dbg("start: probing julia")
     ver, julia = probe_julia(ctx.julia, ctx.project)
+    dbg("start: julia $ver at $julia")
     envdir = ensure_env(julia, ver)
+    dbg("start: env ready at $envdir")
 
     startup = get(flags, "startup", String[])
     threads = get(flags, "threads", nothing)
@@ -221,7 +228,9 @@ function cmd_start(ctx, flags)
     append!(dargs, ["--startup=$s" for s in startup])
 
     cmd = `$julia $jargs $(joinpath(JLD_HOME, "src", "daemon_main.jl")) $dargs`
+    dbg("start: spawning daemon")
     proc = run(pipeline(detach(setenv(cmd, env)), stdin=devnull, stdout=logio, stderr=logio), wait=false)
+    dbg("start: spawned, waiting for readiness")
     close(logio)
 
     info("starting daemon for $(ctx.project) (id $(ctx.id))...")
