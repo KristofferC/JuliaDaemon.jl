@@ -117,7 +117,10 @@ end
 
 # ---- daemon state ----
 
-function try_ping(dir)
+# Returns the daemon state Dict, `:timeout` if the socket connects but the
+# daemon does not answer (wedged in a non-yielding eval), or nothing if not
+# running.
+function try_ping(dir; timeout=2.0)
     sockpath = joinpath(dir, "sock")
     issocket(sockpath) || return nothing
     conn = try
@@ -127,7 +130,9 @@ function try_ping(dir)
     end
     try
         write_frame(conn, "ping")
-        kind, payload = read_frame(conn)
+        t = @async read_frame(conn)
+        timedwait(() -> istaskdone(t), timeout; pollint=0.05) === :ok || return :timeout
+        kind, payload = fetch(t)
         kind == "pong" || return nothing
         return TOML.parse(payload)
     catch
@@ -136,6 +141,8 @@ function try_ping(dir)
         close(conn)
     end
 end
+
+ping_alive(dir) = try_ping(dir) isa Dict
 
 read_toml(path) = isfile(path) ? (try TOML.parsefile(path) catch; nothing end) : nothing
 daemon_toml(ctx) = read_toml(joinpath(ctx.dir, "daemon.toml"))
@@ -187,7 +194,9 @@ function cmd_start(ctx, flags)
     delete!(env, "JULIA_PROJECT")
 
     jargs = ["--startup-file=no", "--project=$(ctx.project)"]
-    threads !== nothing && push!(jargs, "--threads=$threads")
+    # N default threads for evals + 1 interactive thread for the control plane
+    # (ping/status/queueing/RemoteREPL stay responsive during CPU-bound evals).
+    push!(jargs, "--threads=$(something(threads, "1")),1")
     dargs = ["--dir=$(ctx.dir)"]
     append!(dargs, ["--startup=$s" for s in startup])
 
@@ -206,7 +215,7 @@ function cmd_start(ctx, flags)
             exit(1)
         end
         st = try_ping(ctx.dir)
-        if st !== nothing
+        if st isa Dict
             info("daemon ready in $(round(time() - t0, digits=1))s (pid $(st["pid"]), julia $(st["julia_version"]))")
             return
         end
@@ -282,9 +291,14 @@ function stream_response(ctx, conn, flags)
 
     status = Ref("error")
     lost = Ref(false)
+    got_frame = Ref(false)
+    hint = Timer(5) do _
+        got_frame[] || info("no response from daemon yet; it may be busy in a non-yielding computation (`jld status`, `jld kill` if stuck)")
+    end
     reader = @async begin
         while true
             kind, payload = read_frame(conn)
+            got_frame[] = true
             if kind == "out"
                 write(stdout, payload); flush(stdout)
             elseif kind == "err"
@@ -296,10 +310,10 @@ function stream_response(ctx, conn, flags)
             elseif kind == "done"
                 status[] = get(TOML.parse(payload), "status", "error")
                 return
-            else # eof
+            elseif kind == "eof"
                 lost[] = true
                 return
-            end
+            end # other kinds (e.g. "ack") just mark liveness
         end
     end
 
@@ -322,6 +336,7 @@ function stream_response(ctx, conn, flags)
         end
     end
     timer !== nothing && close(timer)
+    close(hint)
     close(conn)
 
     if lost[]
@@ -391,9 +406,9 @@ function cmd_interrupt(ctx)
     kind, payload = read_frame(conn)
     close(conn)
     if kind == "done" && contains(payload, "ok")
-        info("interrupt delivered")
+        info("interrupt requested; it lands at the eval's next yield point (CPU-bound code may run to completion first — `jld kill` if stuck)")
     else
-        info("nothing to interrupt (daemon idle, or eval not at a yield point)")
+        info("nothing to interrupt (daemon idle)")
     end
 end
 
@@ -402,9 +417,11 @@ function cmd_status(ctx)
     dt = daemon_toml(ctx)
     println("id:       ", ctx.id)
     println("project:  ", ctx.project)
-    if st === nothing
+    if !(st isa Dict)
         pid = dt === nothing ? nothing : get(dt, "pid", nothing)
-        if pid !== nothing && pid_alive(pid)
+        if st === :timeout
+            println("state:    unresponsive (pid $pid busy in a non-yielding eval, or still loading; `jld kill` if stuck)")
+        elseif pid !== nothing && pid_alive(pid)
             println("state:    unresponsive (pid $pid alive but not answering; still loading or wedged)")
         else
             println("state:    not running")
@@ -430,9 +447,11 @@ function cmd_list()
         cfg = read_toml(joinpath(dir, "config.toml"))
         cfg === nothing && continue
         st = try_ping(dir)
-        state = st === nothing ? "dead" : (st["busy"] ? "busy" : "idle")
+        state = st isa Dict ? (st["busy"] ? "busy" : "idle") :
+                st === :timeout ? "unresponsive" : "dead"
         dt = read_toml(joinpath(dir, "daemon.toml"))
-        pid = st !== nothing ? string(st["pid"]) : "-"
+        pid = st isa Dict ? string(st["pid"]) :
+              st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
         port = dt !== nothing ? string(get(dt, "repl_port", "-")) : "-"
         push!(rows, (id, state, pid, port, get(cfg, "project", "?")))
     end
@@ -453,7 +472,7 @@ function ctx_from_id(idarg)
     isempty(matches) && die("no daemon matching \"$idarg\" (see `jld list`)", 3)
     if length(matches) > 1 && !(idarg in matches)
         # Prefer a unique running daemon over dead prefix-siblings.
-        running = filter(id -> try_ping(joinpath(cache_root(), id)) !== nothing, matches)
+        running = filter(id -> ping_alive(joinpath(cache_root(), id)), matches)
         length(running) == 1 ||
             die("ambiguous id \"$idarg\": matches $(join(matches, ", "))")
         matches = running
@@ -467,7 +486,7 @@ end
 
 # With no project and no id: connect to the single running daemon, if unique.
 function ctx_from_only_running()
-    running = filter(id -> try_ping(joinpath(cache_root(), id)) !== nothing, known_ids())
+    running = filter(id -> ping_alive(joinpath(cache_root(), id)), known_ids())
     isempty(running) && die("no running daemons", 3)
     if length(running) > 1
         info("multiple daemons running; pick one with `jld connect <id>`:")
@@ -479,7 +498,9 @@ end
 
 function cmd_connect(ctx, flags)
     st = try_ping(ctx.dir)
+    st === :timeout && die("daemon is unresponsive (busy in a non-yielding eval?); it cannot accept a REPL until the eval yields or finishes — see `jld status`, or `jld kill` if stuck", 3)
     st === nothing && die("daemon not running; start it with `jld start`", 3)
+    st["busy"] && info("note: daemon is busy (`$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s); the REPL shares the session and runs alongside it")
     dt = daemon_toml(ctx)
     port = dt["repl_port"]
     dver = string(get(dt, "julia_version", "?"))
@@ -563,7 +584,7 @@ commands:
   start             start the daemon (pre-warm); --startup='using Foo' to run code at boot
   restart           restart (needed after struct redefinitions); keeps recorded --startup
   stop | kill       stop gracefully | SIGKILL
-  interrupt         send SIGINT to interrupt the current eval, daemon survives
+  interrupt         interrupt the current eval at its next yield point; daemon survives
   status [--all]    daemon state for this project; all daemons if --all or outside a project
   list              list all daemons
   connect [id]      attach an interactive REPL (RemoteREPL) to this project's daemon,
@@ -578,7 +599,8 @@ flags:
   --name=NAME       distinct daemon for the same project (env: JLD_NAME)
   --julia=BIN       julia executable for the daemon (env: JLD_JULIA, default: julia)
   --startup=CODE    code to run at daemon boot (repeatable; with start/restart)
-  --threads=N       daemon thread count (interrupts are less reliable with N>1)
+  --threads=N       daemon eval threads (default 1; +1 interactive thread is always
+                    added so status/queueing/REPL work during CPU-bound evals)
   --timeout=SECS    eval/run: interrupt after SECS (exit 124); start: wait limit
   --no-autostart    fail instead of autostarting (eval/run)
 

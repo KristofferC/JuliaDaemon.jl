@@ -2,6 +2,7 @@ module JLDDaemon
 
 using Sockets
 using TOML
+import Logging
 import REPL
 import Revise
 import RemoteREPL
@@ -52,6 +53,9 @@ function main(args::Vector{String})
     isempty(dir) && error("missing --dir")
 
     STARTED[] = time()
+    # Pin logging (e.g. RemoteREPL's connection @infos) to the log file now;
+    # resolving `stderr` at log time would hit the per-request redirection.
+    Logging.global_logger(Logging.ConsoleLogger(stderr))
     logmsg("starting daemon, project = $(Base.active_project())")
 
     sockpath = joinpath(dir, "sock")
@@ -72,7 +76,11 @@ function main(args::Vector{String})
     end
 
     logmsg("ready (pid $(Libc.getpid()), REPL port $repl_port)")
-    EVAL_TASK[] = @async eval_loop(requests)
+    # Evals run on the default pool; this (root) task and everything @async'd
+    # from it — accept loop, connection handlers, RemoteREPL — live on the
+    # interactive thread, so ping/status/queueing/REPL stay responsive even
+    # while an eval is compute-bound and never yields.
+    EVAL_TASK[] = Threads.@spawn :default eval_loop(requests)
     wait(EVAL_TASK[])
 end
 
@@ -269,11 +277,13 @@ end
 
 function run_request(req)
     t0 = time()
+    safe_send(req, "ack", "")
     orig_stdout, orig_stderr = stdout, stderr
     rd_out, wr_out = redirect_stdout()
     rd_err, wr_err = redirect_stderr()
-    pump_out = @async pump(rd_out, "out", req)
-    pump_err = @async pump(rd_err, "err", req)
+    # Pump on the interactive thread so output streams while the eval computes.
+    pump_out = Threads.@spawn :interactive pump(rd_out, "out", req)
+    pump_err = Threads.@spawn :interactive pump(rd_err, "err", req)
 
     status = "ok"
     resultstr = nothing
