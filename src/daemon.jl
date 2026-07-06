@@ -249,7 +249,7 @@ function setup_server(dir)
     end
     NAME[] = string(get(cfg, "name", ""))
 
-    server = listen_or_yield(joinpath(dir, "sock"))
+    server = listen_or_yield(daemon_sock(dir))
     server === nothing && return nothing
 
     TRANSCRIPT_PATH[] = joinpath(dir, "transcript.log")
@@ -292,7 +292,7 @@ function serve_session(; name::AbstractString="repl")
             "julia" => joinpath(Sys.BINDIR, "julia"), "startup" => String[]))
     end
     atexit() do
-        rm(joinpath(dir, "sock"), force=true)
+        Sys.iswindows() || rm(joinpath(dir, "sock"), force=true)
     end
     LOG_IO[] = open(joinpath(dir, "daemon.log"), "a")
     SESSION[] = true
@@ -303,7 +303,7 @@ function serve_session(; name::AbstractString="repl")
     end
     EVAL_TASK[] = Base.errormonitor(Threads.@spawn :default eval_loop(requests))
     if isinteractive()
-        @async serve_input(joinpath(dir, "repl.sock"))  # `jld eval-repl` paste target
+        @async serve_input(input_sock(dir))  # `jld eval-repl` paste target
         try
             install_session_input_transcript()
         catch e
@@ -355,7 +355,7 @@ function listen_or_yield(sockpath)
         return nothing
     catch
     end
-    rm(sockpath, force=true)
+    Sys.iswindows() || rm(sockpath, force=true)
     listen(sockpath)
 end
 

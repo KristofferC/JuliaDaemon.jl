@@ -138,10 +138,8 @@ end
 # daemon does not answer (wedged in a non-yielding eval), or nothing if not
 # running.
 function try_ping(dir; timeout=2.0)
-    sockpath = joinpath(dir, "sock")
-    issocket(sockpath) || return nothing
     conn = try
-        connect(sockpath)
+        connect(daemon_sock(dir))
     catch
         return nothing
     end
@@ -188,7 +186,7 @@ function cmd_start(ctx, flags)
     mkpath(ctx.dir)
     chmod(dirname(ctx.dir), 0o700)
     chmod(ctx.dir, 0o700)  # the socket grants code execution as this user
-    rm(joinpath(ctx.dir, "sock"), force=true)
+    Sys.iswindows() || rm(joinpath(ctx.dir, "sock"), force=true)
     rm(joinpath(ctx.dir, "daemon.toml"), force=true)
     ver, julia = probe_julia(ctx.julia, ctx.project)
     envdir = ensure_env(julia, ver)
@@ -289,7 +287,7 @@ function cmd_exec(ctx, kind, arg, flags)
     ensure_running(ctx, flags)
 
     conn = try
-        connect(joinpath(ctx.dir, "sock"))
+        connect(daemon_sock(ctx.dir))
     catch
         die("cannot connect to daemon socket; try `jld restart`", 3)
     end
@@ -385,25 +383,22 @@ function stream_response(ctx, conn, flags)
 end
 
 function cmd_stop(ctx)
-    sockpath = joinpath(ctx.dir, "sock")
-    if issocket(sockpath)
-        try
-            conn = connect(sockpath)
-            write_frame(conn, "shutdown")
-            while true
-                kind, payload = read_frame(conn)
-                kind == "warn" && (info(payload); continue)
-                if kind == "done" && contains(payload, "refused")
-                    close(conn)
-                    exit(2)
-                end
-                break
+    try
+        conn = connect(daemon_sock(ctx.dir))
+        write_frame(conn, "shutdown")
+        while true
+            kind, payload = read_frame(conn)
+            kind == "warn" && (info(payload); continue)
+            if kind == "done" && contains(payload, "refused")
+                close(conn)
+                exit(2)
             end
-            close(conn)
-            info("daemon stopped")
-            return
-        catch
+            break
         end
+        close(conn)
+        info("daemon stopped")
+        return
+    catch
     end
     pid = daemon_pid(ctx)
     if pid !== nothing && pid_alive(pid)
@@ -412,7 +407,7 @@ function cmd_stop(ctx)
     else
         info("daemon not running")
     end
-    rm(sockpath, force=true)
+    Sys.iswindows() || rm(joinpath(ctx.dir, "sock"), force=true)
 end
 
 function cmd_kill(ctx)
@@ -423,7 +418,7 @@ function cmd_kill(ctx)
     else
         info("daemon not running")
     end
-    rm(joinpath(ctx.dir, "sock"), force=true)
+    Sys.iswindows() || rm(joinpath(ctx.dir, "sock"), force=true)
 end
 
 function cmd_restart(ctx, flags)
@@ -442,7 +437,7 @@ end
 
 function cmd_interrupt(ctx)
     conn = try
-        connect(joinpath(ctx.dir, "sock"))
+        connect(daemon_sock(ctx.dir))
     catch
         die("daemon not running", 3)
     end
@@ -562,12 +557,10 @@ end
 function cmd_eval_repl(ctx, arg)
     code = arg === nothing ? read(stdin, String) : arg
     isempty(strip(code)) && die("no code given")
-    sockpath = joinpath(ctx.dir, "repl.sock")
-    issocket(sockpath) || die("no REPL attached to $(ctx.id); start one with `jld connect`", 3)
     conn = try
-        connect(sockpath)
+        connect(input_sock(ctx.dir))
     catch
-        die("attached REPL is gone (stale socket); reconnect with `jld connect`", 3)
+        die("no REPL attached to $(ctx.id); start one with `jld connect`", 3)
     end
     write_frame(conn, "paste", code)
     kind, _ = read_frame(conn)
@@ -580,8 +573,8 @@ end
 function ctx_for_eval_repl(flags)
     find_project(get(flags, "project", nothing)) !== nothing && return make_ctx(flags)
     ctx = make_ctx(flags)
-    issocket(joinpath(ctx.dir, "repl.sock")) && return ctx
-    attached = filter(id -> issocket(joinpath(cache_root(), id, "repl.sock")), known_ids())
+    sock_serving(input_sock(ctx.dir)) && return ctx
+    attached = filter(id -> sock_serving(input_sock(joinpath(cache_root(), id))), known_ids())
     isempty(attached) && die("no attached REPL found; start one with `jld connect`", 3)
     length(attached) > 1 &&
         die("multiple attached REPLs ($(join(attached, ", "))); pass --id", 3)
@@ -617,7 +610,7 @@ function cmd_connect(ctx, flags)
     end
     st["busy"] && info("note: daemon is busy (`$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s); the REPL shares the session and runs alongside it")
     dt = something(daemon_toml(ctx), Dict{String,Any}())
-    sockpath = joinpath(ctx.dir, "sock")
+    sockpath = daemon_sock(ctx.dir)
     if get(flags, "print", false)
         println("daemon socket: $sockpath (framed text protocol; any julia can attach)")
         println("attach with:   jld connect $(ctx.id)")
@@ -629,7 +622,7 @@ function cmd_connect(ctx, flags)
     isfile(julia) || (julia = ctx.julia)
     # A session daemon owns repl.sock (eval-repl pastes go to *its* prompt);
     # only spawned daemons hand it to the attached REPL.
-    inputsock = get(dt, "kind", "") == "session" ? "" : joinpath(ctx.dir, "repl.sock")
+    inputsock = get(dt, "kind", "") == "session" ? "" : input_sock(ctx.dir)
     info("connecting to $(ctx.id) (backspace for the local julia> prompt, Ctrl-D to exit)")
     script = joinpath(JLD_HOME, "src", "connect_repl.jl")
     # default_julia_env: the app shim pins JULIA_LOAD_PATH to the app env,
@@ -655,7 +648,7 @@ function cmd_stacks(ctx)
         "daemon unresponsive (started before thread support? `jld restart`)" :
         "daemon not running", 3)
     conn = try
-        connect(joinpath(ctx.dir, "sock"))
+        connect(daemon_sock(ctx.dir))
     catch
         die("cannot connect to daemon socket", 3)
     end

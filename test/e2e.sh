@@ -4,8 +4,14 @@
 set -uo pipefail
 
 JLD_HOME="$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
-JLD="$JLD_HOME/bin/jld"
 WORK="$(mktemp -d)"
+# On Windows (Git Bash), use mixed-form paths (C:/...) that both bash and
+# native julia understand.
+if command -v cygpath >/dev/null 2>&1; then
+    JLD_HOME="$(cygpath -m "$JLD_HOME")"
+    WORK="$(cygpath -m "$WORK")"
+fi
+JLD="$JLD_HOME/bin/jld"
 export XDG_CACHE_HOME="$WORK/cache"
 NAME="e2e$$"
 FAILS=0
@@ -140,7 +146,8 @@ checkout "transcript truncates big output" "bytes of output omitted" "$out"
 out=$(julia --startup-file=no -e "
 using Sockets
 include(\"$JLD_HOME/src/protocol.jl\")
-conn = connect(\"$XDG_CACHE_HOME/julia-daemon/\" * filter(startswith(\"ToyPkg-$NAME\"), readdir(\"$XDG_CACHE_HOME/julia-daemon\"))[1] * \"/sock\")
+root = \"$XDG_CACHE_HOME/julia-daemon\"
+conn = connect(daemon_sock(joinpath(root, filter(startswith(\"ToyPkg-$NAME\"), readdir(root))[1])))
 write_frame(conn, \"complete\", \"partial = \\\"prin\\\"\nfull = \\\"prin\\\"\n\")
 kind, payload = read_frame(conn)
 print(kind, \": \", payload)" 2>/dev/null)
@@ -154,7 +161,7 @@ Main.JLDDaemon.serve_session(name=\"ci\")
 sess_var = 1234
 sleep(120)" >/dev/null 2>&1 &
 SESSPID=$!
-for i in $(seq 1 50); do
+for i in $(seq 1 120); do
     $JLD --id=ToyPkg-ci eval '1' >/dev/null 2>&1 && break
     sleep 0.5
 done

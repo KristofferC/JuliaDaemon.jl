@@ -9,6 +9,23 @@ const JLD_PROTO = 1
 # garbage length header.
 const MAX_FRAME = 128 * 1024 * 1024
 
+# Rendezvous endpoints: unix domain sockets on posix; named pipes on Windows
+# (same Sockets API, but they live in the pipe namespace, not the filesystem).
+daemon_sock(dir) = Sys.iswindows() ? "\\\\.\\pipe\\jld-" * basename(dir) : joinpath(dir, "sock")
+input_sock(dir) = Sys.iswindows() ? "\\\\.\\pipe\\jld-" * basename(dir) * "-repl" : joinpath(dir, "repl.sock")
+
+# Whether something serves the endpoint right now (pipes have no fs entry, so
+# probing means connecting).
+function sock_serving(path)
+    conn = try
+        Sockets.connect(path)
+    catch
+        return false
+    end
+    close(conn)
+    true
+end
+
 function write_frame(io::IO, kind::AbstractString, payload::AbstractString="")
     data = codeunits(payload)
     buf = IOBuffer(sizehint=length(data) + 16)

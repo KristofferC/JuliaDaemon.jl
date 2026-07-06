@@ -2,6 +2,11 @@
 # end. Hermetic (temp XDG_CACHE_HOME). Run with: julia test/repl.jl
 using Test
 
+if Sys.iswindows()
+    println("repl pty test skipped on Windows (no posix ptys)")
+    exit(0)
+end
+
 const JLD_HOME = dirname(@__DIR__)
 const JLD = joinpath(JLD_HOME, "bin", "jld")
 
