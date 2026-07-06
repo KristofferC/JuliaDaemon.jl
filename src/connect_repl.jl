@@ -41,6 +41,24 @@ function inject_input(data::AbstractString)
     end
 end
 
+# If the user has a partial line typed at the prompt, take it out of the edit
+# buffer (it is re-inserted at the fresh prompt after the paste runs), so the
+# paste never splices into their in-progress input.
+function stash_pending_input()
+    try
+        repl = Base.active_repl
+        mistate = repl.mistate
+        mistate === nothing && return ""
+        ps = REPL.LineEdit.state(mistate)
+        buf = REPL.LineEdit.buffer(ps)
+        pending = String(buf.data[1:buf.size])
+        isempty(pending) || take!(buf)
+        return pending
+    catch
+        return ""
+    end
+end
+
 function serve_input(sockpath)
     rm(sockpath, force=true)
     server = try
@@ -62,8 +80,12 @@ function serve_input(sockpath)
                 if kind == "paste"
                     # Bracketed-paste markers make LineEdit treat this exactly
                     # like a terminal paste: echoed at the prompt, evaluated,
-                    # prompt redrawn.
-                    inject_input("\e[200~" * strip(payload, '\n') * "\e[201~\n")
+                    # prompt redrawn. Any half-typed user input is stashed and
+                    # re-inserted (without newline) at the prompt afterwards;
+                    # byte order in the tty buffer guarantees the sequencing.
+                    pending = stash_pending_input()
+                    restore = isempty(pending) ? "" : "\e[200~" * pending * "\e[201~"
+                    inject_input("\e[200~" * strip(payload, '\n') * "\e[201~\n" * restore)
                     write_frame(conn, "done", "status = \"ok\"\n")
                 end
             catch
