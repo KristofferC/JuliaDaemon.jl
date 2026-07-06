@@ -1,15 +1,14 @@
 name = "JuliaDaemon"
 uuid = "e081e1ac-e4c7-43cb-85d5-510266067ed8"
-authors = ["Kristoffer Carlsson <kristoffer.carlsson@juliahub.com>"]
 version = "0.1.0"
+authors = ["Kristoffer Carlsson <kristoffer.carlsson@juliahub.com>"]
 
 [deps]
 SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 TOML = "fa267f1f-6049-4f14-aa54-33bafae1ed76"
 
-[apps]
-jld = { julia_flags = ["--compile=min", "-O0", "--history-file=no"] }
-
 [compat]
 julia = "1.11"
+
+[apps.jld]
