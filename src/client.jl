@@ -451,8 +451,8 @@ function cmd_connect(ctx, flags)
     info("connecting to $(ctx.id) on port $port (press '>' for the remote prompt, backspace to leave it, Ctrl-D to exit)")
     env = copy(ENV)
     env["JULIA_LOAD_PATH"] = "@:$envdir:@stdlib"
-    code = "import RemoteREPL; atreplinit(_ -> @async(begin sleep(0.25); RemoteREPL.connect_repl($port) end))"
-    p = run(ignorestatus(setenv(`$julia --project=$(ctx.project) -i -e $code`, env)))
+    script = joinpath(JLD_HOME, "src", "connect_repl.jl")
+    p = run(ignorestatus(setenv(`$julia --project=$(ctx.project) -i $script $port`, env)))
     exit(p.exitcode)
 end
 
