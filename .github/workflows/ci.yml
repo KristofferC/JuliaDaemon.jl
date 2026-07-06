@@ -35,4 +35,5 @@ jobs:
         run: test/e2e.sh
         timeout-minutes: 25
       - name: Remote REPL tests (pty)
+        timeout-minutes: 10
         run: julia --color=yes test/repl.jl

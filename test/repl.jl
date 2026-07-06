@@ -41,6 +41,15 @@ strip_ansi(s) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "", r"\e\][0-9];[^\a]*\a?"
 
 ptm, pts = open_pty()
 const captured = IOBuffer()
+
+# Watchdog: a hung interaction should fail with diagnostics, not eat the
+# CI job timeout silently.
+@async begin
+    sleep(420)
+    println("WATCHDOG: pty test still running after 7 minutes; captured output tail:")
+    println(strip_ansi(String(take!(copy(captured))))[max(1, end-3000):end])
+    exit(3)
+end
 reader = @async try
     while !eof(ptm)
         write(captured, readavailable(ptm))
