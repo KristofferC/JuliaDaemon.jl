@@ -465,9 +465,15 @@ function cmd_status(ctx)
         println("history:  jld transcript   ($(joinpath(ctx.dir, "transcript.log")))")
 end
 
-function cmd_list()
+function cmd_list(flags=Dict{String,Any}())
     root = cache_root()
     entries = isdir(root) ? sort(readdir(root)) : String[]
+    # The daemon this context would target (what `jld eval` here acts upon).
+    target = try
+        make_ctx(flags).id
+    catch
+        nothing
+    end
     rows = Vector{NTuple{5,String}}()
     for id in entries
         dir = joinpath(root, id)
@@ -487,9 +493,10 @@ function cmd_list()
     isempty(rows) && (println("no daemons"); return)
     header = ("ID", "STATE", "PID", "JULIA", "PROJECT")
     widths = [maximum(length.([header[i], (r[i] for r in rows)...])) for i in 1:4]
-    printrow(r) = println(join([rpad(r[i], widths[i]) for i in 1:4], "  "), "  ", r[5])
+    printrow(r; mark="  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:4], "  "), "  ", r[5])
     printrow(header)
-    foreach(printrow, rows)
+    foreach(r -> printrow(r; mark=(r[1] == target ? "* " : "  ")), rows)
+    any(r -> r[1] == target, rows) && info("* = the daemon `jld eval` targets from here")
     ndead = count(r -> r[2] == "dead", rows)
     ndead > 0 && info("$ndead dead; `jld gc` removes their state (config, log, transcript)")
 end
@@ -714,8 +721,8 @@ commands:
   restart           restart (needed after struct redefinitions); keeps recorded --startup
   stop | kill       stop gracefully | SIGKILL
   interrupt         interrupt the current eval at its next yield point; daemon survives
-  status [--all]    state of the daemon this context targets; --all lists all daemons
-  list              list all daemons
+  status            state of the daemon this context targets (see `list` for all)
+  list              list all daemons; * marks the one this context targets
   gc                remove the state (config, log, transcript) of dead daemons
   connect [id]      attach an interactive REPL to this project's daemon,
                     or to any daemon by id/prefix (see `jld list`); outside a project
@@ -770,7 +777,7 @@ function parse_cli(args)
                 end
             else
                 k = a[3:end]
-                k in ("no-autostart", "print", "follow", "help", "all") || die("unknown flag --$k")
+                k in ("no-autostart", "print", "follow", "help") || die("unknown flag --$k")
                 flags[k] = true
             end
         else
@@ -794,7 +801,7 @@ function run_cli(args::Vector{String})
     outside_project() = !byid && find_project(get(flags, "project", nothing)) === nothing
 
     if cmd == "list"
-        cmd_list()
+        cmd_list(flags)
         return
     elseif cmd == "gc"
         cmd_gc()
@@ -803,11 +810,7 @@ function run_cli(args::Vector{String})
         cmd_install()
         return
     elseif cmd == "status"
-        if !byid && get(flags, "all", false)
-            cmd_list()
-        else
-            cmd_status(resolve())
-        end
+        cmd_status(resolve())
         return
     elseif cmd == "connect"
         posid = length(pos) >= 2 ? pos[2] : nothing
