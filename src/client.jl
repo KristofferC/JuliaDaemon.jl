@@ -662,13 +662,22 @@ function cmd_install()
     # Copy the skill rather than symlink: app-installed package directories
     # are versioned and move on update, which would leave a dangling link.
     src = joinpath(JLD_HOME, "skill")
-    dst = joinpath(homedir(), ".claude", "skills", "julia-daemon")
-    islink(dst) && rm(dst)
-    mkpath(dst)
-    for f in readdir(src)
-        cp(joinpath(src, f), joinpath(dst, f); force=true)
+    # ~/.agents/skills is the cross-tool Agent Skills location (opencode,
+    # Gemini CLI, ...); tool-specific dirs are added for agents that only
+    # read their own (when they appear installed).
+    targets = [joinpath(homedir(), ".agents", "skills", "julia-daemon")]
+    for tooldir in (".claude", ".codex")
+        isdir(joinpath(homedir(), tooldir)) &&
+            push!(targets, joinpath(homedir(), tooldir, "skills", "julia-daemon"))
     end
-    info("installed skill: $dst")
+    for dst in targets
+        islink(dst) && rm(dst)
+        mkpath(dst)
+        for f in readdir(src)
+            cp(joinpath(src, f), joinpath(dst, f); force=true)
+        end
+        info("installed skill: $dst")
+    end
     # A bin symlink is only needed when jld is not already reachable
     # (the Pkg app shim in ~/.julia/bin makes this unnecessary).
     if Sys.which("jld") === nothing
@@ -713,7 +722,9 @@ commands:
   stacks [id]       show task backtraces of what the daemon is currently executing
   logs [-f]         show daemon log
   setup             (re)install the daemon environment for the selected julia
-  install           install the Claude Code skill (+ ~/.local/bin/jld symlink if jld is not on PATH)
+  install           install the agent skill into ~/.agents/skills (cross-tool) and the
+                    skills dirs of installed agents (~/.claude, ~/.codex);
+                    plus a ~/.local/bin/jld symlink if jld is not on PATH
 
 flags:
   --project=PATH    project to serve (default: JULIA_PROJECT, nearest Project.toml,

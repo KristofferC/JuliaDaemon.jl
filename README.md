@@ -57,11 +57,14 @@ As a Pkg app (julia 1.12+; puts the `jld` shim in `~/.julia/bin`, keep it on PAT
 
 ```
 pkg> app add <this repo url>
-$ jld install        # copies the Claude Code skill into ~/.claude/skills
+$ jld install        # installs the agent skill (SKILL.md)
 ```
 
-Or from a clone: `JuliaDaemon.jl/bin/jld install` — same, plus a
-`~/.local/bin/jld` symlink if `jld` is not already on PATH.
+`install` copies the skill into `~/.agents/skills/` (the cross-tool Agent
+Skills location, read by opencode, Gemini CLI, …) and into the skills dirs
+of installed agents that only read their own (`~/.claude`, `~/.codex`).
+From a clone, `JuliaDaemon.jl/bin/jld install` also symlinks
+`~/.local/bin/jld` if `jld` is not already on PATH.
 
 Daemon dependencies (Revise, RemoteREPL) install themselves on first use.
 

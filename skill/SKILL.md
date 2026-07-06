@@ -38,8 +38,9 @@ be handled by Revise on Julia ≥1.12; on older Julia they need `jld restart`.
 ## Interrupting
 
 `jld interrupt` stops the current eval at the next yield point; the daemon
-survives. Pure CPU loops that never yield cannot be soft-interrupted:
-`jld kill`, then the next eval autostarts fresh.
+survives. Pure CPU loops that never yield cannot be soft-interrupted: check
+`jld stacks` to see what it is doing, then `jld kill` if stuck — the next
+eval autostarts fresh.
 
 ## Commands
 
@@ -50,7 +51,7 @@ jld eval-scratch '<code>'  eval in a throwaway module that sees Main's bindings 
 jld run <file.jl>   include a file                              [autostarts]
 jld start           pre-warm; --startup='using MyPkg' runs at boot
 jld restart         reload from scratch (keeps recorded --startup)
-jld status | list | logs [-f] | stop | kill | interrupt
+jld status | list | logs [-f] | stop | kill | interrupt | gc
 jld stacks          task backtraces of what the daemon is executing right now
 jld transcript      full session history (all inputs + outputs, incl. the human's
                     REPL) — read this first when joining an existing session
