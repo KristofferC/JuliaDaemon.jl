@@ -583,8 +583,8 @@ function cmd_list(flags=Dict{String,Any}())
     catch
         nothing
     end
-    rows = Vector{NTuple{5,String}}()
-    for id in entries
+    rows = Vector{NTuple{6,String}}()
+    for id in known_ids()
         dir = joinpath(root, id)
         cfg = read_toml(joinpath(dir, "config.toml"))
         cfg === nothing && continue
@@ -597,15 +597,15 @@ function cmd_list(flags=Dict{String,Any}())
         pid = st isa Dict ? string(st["pid"]) :
               st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
         jver = dt !== nothing ? string(get(dt, "julia_version", "-")) : "-"
-        push!(rows, (id, state, pid, jver, get(cfg, "project", "?")))
+        push!(rows, (string(length(rows) + 1), id, state, pid, jver, get(cfg, "project", "?")))
     end
     isempty(rows) && (println("no daemons"); return)
-    header = ("ID", "STATE", "PID", "JULIA", "PROJECT")
-    widths = [maximum(length.([header[i], (r[i] for r in rows)...])) for i in 1:4]
-    printrow(r; mark="  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:4], "  "), "  ", r[5])
+    header = ("#", "ID", "STATE", "PID", "JULIA", "PROJECT")
+    widths = [maximum(length.([header[i], (r[i] for r in rows)...])) for i in 1:5]
+    printrow(r; mark="  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:5], "  "), "  ", r[6])
     printrow(header)
-    foreach(r -> printrow(r; mark=(r[1] == target ? "* " : "  ")), rows)
-    ndead = count(r -> r[2] == "dead", rows)
+    foreach(r -> printrow(r; mark=(r[2] == target ? "* " : "  ")), rows)
+    ndead = count(r -> r[3] == "dead", rows)
     ndead > 0 && info("$ndead dead; `jld gc` removes their state (config, log, transcript)")
 end
 
@@ -614,7 +614,15 @@ known_ids() = (root = cache_root(); isdir(root) ?
 
 function ctx_from_id(idarg)
     ids = known_ids()
+    # A plain number is a row as shown by `jld list`.
+    if !isempty(idarg) && all(isdigit, idarg)
+        n = parse(Int, idarg)
+        1 <= n <= length(ids) || die("no daemon #$n (see `jld list`)", 3)
+        return ctx_from_known(ids[n])
+    end
     matches = filter(d -> d == idarg || startswith(d, idarg), ids)
+    # Fall back to substring matching, so the hash part alone works too.
+    isempty(matches) && (matches = filter(d -> occursin(idarg, d), ids))
     isempty(matches) && die("no daemon matching \"$idarg\" (see `jld list`)", 3)
     if length(matches) > 1 && !(idarg in matches)
         # Prefer a unique running daemon over dead prefix-siblings.
@@ -624,6 +632,10 @@ function ctx_from_id(idarg)
         matches = running
     end
     id = idarg in matches ? idarg : only(matches)
+    ctx_from_known(id)
+end
+
+function ctx_from_known(id)
     dir = joinpath(cache_root(), id)
     cfg = read_toml(joinpath(dir, "config.toml"))
     cfg === nothing && die("unreadable daemon state in $dir")
@@ -855,7 +867,8 @@ flags:
   --project=PATH    project to serve (default: JULIA_PROJECT, nearest Project.toml,
                     or the default environment — like plain julia)
   --name=NAME       distinct daemon for the same project (env: JLD_NAME)
-  --id=ID           target an existing daemon by id/prefix (see `jld list`), any command
+  --id=ID           target an existing daemon: id, any unique part of it, or its
+                    row number in `jld list`; works with every command
   --module=M        eval/run: evaluate in module Main.M instead of Main (created on demand)
   --julia=BIN       julia executable for the daemon (env: JLD_JULIA, default: julia)
   --startup=CODE    code to run at daemon boot (repeatable; with start/restart)
