@@ -9,11 +9,11 @@ import SHA
 
 # Optional in session mode (`JuliaDaemon.serve()` in an existing REPL);
 # always present for spawned daemons via the stacked jld environment.
-const HAVE_REVISE = try
+const HAVE_REVISE, REVISE_LOAD_ERROR = try
     @eval import Revise
-    true
-catch
-    false
+    (true, "")
+catch e
+    (false, sprint(showerror, e))
 end
 include("protocol.jl")
 include("repl_input.jl")
@@ -221,6 +221,7 @@ function main(args::Vector{String})
         end
     end
     logmsg("starting daemon, project = $(Base.active_project())")
+    HAVE_REVISE || logmsg("Revise FAILED TO LOAD — running without auto-revision: " * first(REVISE_LOAD_ERROR, 500))
 
     requests = setup_server(dir)
     requests === nothing && return
@@ -400,6 +401,7 @@ function state_toml()
         "transcript" => TRANSCRIPT_PATH[],
         "kind" => SESSION[] ? "session" : "daemon",
         "proto" => JLD_PROTO,
+        "revise" => HAVE_REVISE,
     )
     if cur !== nothing
         d["current"] = first(cur.code, 120)

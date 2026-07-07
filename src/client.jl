@@ -272,6 +272,7 @@ function cmd_start(ctx, flags)
         st = try_ping(ctx.dir)
         if st isa Dict
             info("daemon ready in $(round(time() - t0, digits=1))s (pid $(st["pid"]), julia $(st["julia_version"]))")
+            get(st, "revise", true) || info("WARNING: Revise failed to load in this daemon — source edits will NOT auto-apply (see `jld logs`)")
             return
         end
         if time() - lastmsg > 5
@@ -521,6 +522,7 @@ function cmd_status(ctx)
         return
     end
     println("state:    ", st["busy"] ? "busy" : "idle")
+    get(st, "revise", true) || println("revise:   NOT LOADED — source edits will not auto-apply (see `jld logs`)")
     st["busy"] && println("running:  `$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s")
     println("pid:      ", st["pid"])
     println("julia:    ", st["julia_version"])
