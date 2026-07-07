@@ -19,7 +19,43 @@ die(msg, code=2) = (info(msg); exit(code))
 uv_kill(pid, sig) = ccall(:uv_kill, Cint, (Cint, Cint), pid, sig)
 pid_alive(pid) = uv_kill(pid, Cint(0)) == 0
 
+# After a reboot, recorded pids can belong to unrelated new processes;
+# only trust one as a daemon if it is at least a julia process.
+function pid_is_julia(pid)
+    Sys.iswindows() && return true
+    try
+        if Sys.islinux()
+            return occursin("julia", read("/proc/$pid/cmdline", String))
+        end
+        return occursin("julia", readchomp(`ps -p $pid -o comm=`))
+    catch
+        return false
+    end
+end
+
 cache_root() = joinpath(get(ENV, "XDG_CACHE_HOME", joinpath(homedir(), ".cache")), "julia-daemon")
+
+# Daemons started before the socket relocation still listen inside their
+# state dir; fall back to that so an upgrade does not orphan them.
+function live_sock(dir)
+    s = daemon_sock(dir)
+    sock_serving(s) && return s
+    if !Sys.iswindows()
+        legacy = joinpath(dir, "sock")
+        sock_serving(legacy) && return legacy
+    end
+    s
+end
+
+function live_input_sock(dir)
+    s = input_sock(dir)
+    sock_serving(s) && return s
+    if !Sys.iswindows()
+        legacy = joinpath(dir, "repl.sock")
+        sock_serving(legacy) && return legacy
+    end
+    s
+end
 
 struct Ctx
     project::String
@@ -139,9 +175,10 @@ end
 # daemon does not answer (wedged in a non-yielding eval), or nothing if not
 # running.
 function try_ping(dir; timeout=5.0)
-    dbg("ping: connecting to $(daemon_sock(dir))")
+    sock = live_sock(dir)
+    dbg("ping: connecting to $sock")
     conn = try
-        connect(daemon_sock(dir))
+        connect(sock)
     catch
         dbg("ping: no listener")
         return nothing
@@ -190,7 +227,10 @@ function cmd_start(ctx, flags)
     mkpath(ctx.dir)
     chmod(dirname(ctx.dir), 0o700)
     chmod(ctx.dir, 0o700)  # the socket grants code execution as this user
-    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
+    if !Sys.iswindows()
+        rm(daemon_sock(ctx.dir), force=true)
+        rm(joinpath(ctx.dir, "sock"), force=true)  # legacy location
+    end
     rm(joinpath(ctx.dir, "daemon.toml"), force=true)
     dbg("start: probing julia")
     ver, julia = probe_julia(ctx.julia, ctx.project)
@@ -324,7 +364,7 @@ function cmd_exec(ctx, kind, arg, flags)
     ensure_running(ctx, flags)
 
     conn = try
-        connect(daemon_sock(ctx.dir))
+        connect(live_sock(ctx.dir))
     catch
         die("cannot connect to daemon socket; try `jld restart`", 3)
     end
@@ -424,7 +464,7 @@ function cmd_stop(ctx)
     for attempt in 1:2
         got_any = false
         try
-            conn = connect(daemon_sock(ctx.dir))
+            conn = connect(live_sock(ctx.dir))
             write_frame(conn, "shutdown")
             while true
                 kind, payload = read_frame(conn)
@@ -490,7 +530,7 @@ end
 
 function cmd_interrupt(ctx)
     conn = try
-        connect(daemon_sock(ctx.dir))
+        connect(live_sock(ctx.dir))
     catch
         die("daemon not running", 3)
     end
@@ -565,7 +605,6 @@ function cmd_list(flags=Dict{String,Any}())
     printrow(r; mark="  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:4], "  "), "  ", r[5])
     printrow(header)
     foreach(r -> printrow(r; mark=(r[1] == target ? "* " : "  ")), rows)
-    any(r -> r[1] == target, rows) && info("* = the daemon `jld eval` targets from here")
     ndead = count(r -> r[2] == "dead", rows)
     ndead > 0 && info("$ndead dead; `jld gc` removes their state (config, log, transcript)")
 end
@@ -612,7 +651,7 @@ function cmd_eval_repl(ctx, arg)
     code = arg === nothing ? read(stdin, String) : arg
     isempty(strip(code)) && die("no code given")
     conn = try
-        connect(input_sock(ctx.dir))
+        connect(live_input_sock(ctx.dir))
     catch
         die("no REPL attached to $(ctx.id); start one with `jld connect`", 3)
     end
@@ -627,8 +666,8 @@ end
 function ctx_for_eval_repl(flags)
     find_project(get(flags, "project", nothing)) !== nothing && return make_ctx(flags)
     ctx = make_ctx(flags)
-    sock_serving(input_sock(ctx.dir)) && return ctx
-    attached = filter(id -> sock_serving(input_sock(joinpath(cache_root(), id))), known_ids())
+    sock_serving(live_input_sock(ctx.dir)) && return ctx
+    attached = filter(id -> sock_serving(live_input_sock(joinpath(cache_root(), id))), known_ids())
     isempty(attached) && die("no attached REPL found; start one with `jld connect`", 3)
     length(attached) > 1 &&
         die("multiple attached REPLs ($(join(attached, ", "))); pass --id", 3)
@@ -643,7 +682,7 @@ function cmd_gc()
         try_ping(dir) === nothing || continue  # running or unresponsive: keep
         dt = read_toml(joinpath(dir, "daemon.toml"))
         pid = dt === nothing ? nothing : get(dt, "pid", nothing)
-        pid !== nothing && pid_alive(pid) && continue
+        pid !== nothing && pid_alive(pid) && pid_is_julia(pid) && continue
         # No daemon.toml yet + fresh config: probably still starting up.
         cfg = joinpath(dir, "config.toml")
         dt === nothing && isfile(cfg) && time() - mtime(cfg) < 120 && continue
@@ -664,7 +703,7 @@ function cmd_connect(ctx, flags)
     end
     st["busy"] && info("note: daemon is busy (`$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s); the REPL shares the session and runs alongside it")
     dt = something(daemon_toml(ctx), Dict{String,Any}())
-    sockpath = daemon_sock(ctx.dir)
+    sockpath = live_sock(ctx.dir)
     if get(flags, "print", false)
         println("daemon socket: $sockpath (framed text protocol; any julia can attach)")
         println("attach with:   jld connect $(ctx.id)")
@@ -702,7 +741,7 @@ function cmd_stacks(ctx)
         "daemon unresponsive (started before thread support? `jld restart`)" :
         "daemon not running", 3)
     conn = try
-        connect(daemon_sock(ctx.dir))
+        connect(live_sock(ctx.dir))
     catch
         die("cannot connect to daemon socket", 3)
     end
