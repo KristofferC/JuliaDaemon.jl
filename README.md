@@ -9,6 +9,11 @@ daemon first starts. After that a `jld eval` or `jld run` takes a couple
 hundred milliseconds, streams output as it is produced, and the exit code
 tells you whether the code ran, threw, or never reached a daemon at all.
 
+You are not limited to one daemon on the machine. Every project gets its
+own, they all run side by side, and `jld` picks the right one from the
+directory you are in. A single project can have several too (`--name`), and
+`jld list` shows everything that is running.
+
 The main audience is coding agents, which love to shell out `julia -e` and
 would otherwise pay the full startup cost on every call, but it works just
 as well by hand.
