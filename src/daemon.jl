@@ -659,7 +659,7 @@ function run_request(req)
     # For files, record the contents: scratch scripts get rewritten between
     # runs, so the path alone would lose the session history.
     if req.kind == "include"
-        source = "jld run " * req.code
+        source = (req.scratch ? "jld run --scratch " : "jld run ") * req.code
         input = try
             read(req.code, String)
         catch

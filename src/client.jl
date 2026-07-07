@@ -838,8 +838,7 @@ usage: jld [flags] <command> [args]
 
 commands:
   eval '<code>'     evaluate code in the daemon (reads stdin if no arg); autostarts
-  eval-scratch '<code>'  like eval, but in a fresh module that sees Main's bindings;
-                    everything it creates is released afterwards (no state kept)
+  eval-scratch '<code>'  shorthand for eval --scratch
   run <file.jl>     include() a file in the daemon; autostarts
   start             start the daemon (pre-warm); --startup='using Foo' to run code at boot
   restart           restart (needed after struct redefinitions); keeps recorded --startup
@@ -870,6 +869,8 @@ flags:
   --id=ID           target an existing daemon: id, any unique part of it, or its
                     row number in `jld list`; works with every command
   --module=M        eval/run: evaluate in module Main.M instead of Main (created on demand)
+  --scratch         eval/run: evaluate in a fresh throwaway module that sees Main's
+                    bindings; everything it creates is released afterwards
   --julia=BIN       julia executable for the daemon (env: JLD_JULIA, default: julia)
   --startup=CODE    code to run at daemon boot (repeatable; with start/restart)
   --threads=N       daemon eval threads (default 1; +1 interactive thread is always
@@ -902,7 +903,7 @@ function parse_cli(args)
                 end
             else
                 k = a[3:end]
-                k in ("no-autostart", "print", "follow", "help") || die("unknown flag --$k")
+                k in ("no-autostart", "print", "follow", "help", "scratch") || die("unknown flag --$k")
                 flags[k] = true
             end
         else

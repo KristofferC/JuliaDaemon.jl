@@ -121,6 +121,11 @@ out=$($J eval 'sc_ref = 5;' 2>&8; $J eval-scratch 'sc_tmp = sc_ref * 3' 2>&8; $J
 checkout "eval-scratch sees Main, keeps nothing" "15
 false" "$out"
 
+echo 'rs_tmp = sc_ref + 100; println("run-scratch saw ", rs_tmp)' > "$WORK/rscratch.jl"
+out=$($J run --scratch "$WORK/rscratch.jl" 2>&8; $J eval 'isdefined(Main, :rs_tmp)' 2>&8)
+checkout "run --scratch sees Main, keeps nothing" "run-scratch saw 105
+false" "$out"
+
 # ---- introspection ----
 
 out=$($J stacks 2>&8)
