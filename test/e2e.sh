@@ -140,10 +140,23 @@ checkout "daemon knows its id" "ToyPkg-$NAME" "$out"
 out=$($JLD --id=ToyPkg-$NAME eval '"by id"' 2>&8)
 checkout "eval by --id prefix" "by id" "$out"
 
-out=$($JLD --project="$WORK/ToyPkg" --name=iso eval 'iso_var = 1; "iso ok"' 2>&8)
+out=$($JLD --project="$WORK/ToyPkg" --name=iso --no-revise eval 'iso_var = 1; "iso ok"' 2>&8)
 checkout "second named daemon" "iso ok" "$out"
 out=$($J eval 'isdefined(Main, :iso_var)' 2>&8)
 checkout "named daemons are isolated" "false" "$out"
+
+# ---- --no-revise (the iso daemon autostarted with it) ----
+
+out=$($JLD --project="$WORK/ToyPkg" --name=iso status 2>&8)
+checkout "no-revise: status shows disabled" "disabled (--no-revise)" "$out"
+out=$($JLD --project="$WORK/ToyPkg" --name=iso eval 'isdefined(Main, :Revise)' 2>&8)
+checkout "no-revise: Revise not loaded" "false" "$out"
+$JLD --project="$WORK/ToyPkg" --name=iso restart >/dev/null 2>&8
+out=$($JLD --project="$WORK/ToyPkg" --name=iso eval 'isdefined(Main, :Revise)' 2>&8)
+checkout "no-revise: restart keeps it" "false" "$out"
+$JLD --project="$WORK/ToyPkg" --name=iso restart --revise >/dev/null 2>&8
+out=$($JLD --project="$WORK/ToyPkg" --name=iso eval 'isdefined(Main, :Revise)' 2>&8)
+checkout "no-revise: restart --revise re-enables" "true" "$out"
 
 out=$($JLD --project="$WORK/ToyPkg" list 2>&8)
 checkout "list shows both daemons" "ToyPkg-iso" "$out"

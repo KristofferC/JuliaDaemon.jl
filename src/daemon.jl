@@ -9,11 +9,19 @@ import SHA
 
 # Optional in session mode (`JuliaDaemon.serve()` in an existing REPL);
 # always present for spawned daemons via the stacked jld environment.
-const HAVE_REVISE, REVISE_LOAD_ERROR = try
-    @eval import Revise
-    (true, "")
-catch e
-    (false, sprint(showerror, e))
+# JLD_NO_REVISE is set by the client for `--no-revise` (must be decided here,
+# at include time); dropped from ENV so evals' subprocesses don't inherit it.
+const REVISE_DISABLED = get(ENV, "JLD_NO_REVISE", "") == "1"
+delete!(ENV, "JLD_NO_REVISE")
+const HAVE_REVISE, REVISE_LOAD_ERROR = if REVISE_DISABLED
+    (false, "")
+else
+    try
+        @eval import Revise
+        (true, "")
+    catch e
+        (false, sprint(showerror, e))
+    end
 end
 include("protocol.jl")
 include("repl_input.jl")
@@ -221,7 +229,11 @@ function main(args::Vector{String})
         end
     end
     logmsg("starting daemon, project = $(Base.active_project())")
-    HAVE_REVISE || logmsg("Revise FAILED TO LOAD — running without auto-revision: " * first(REVISE_LOAD_ERROR, 500))
+    if REVISE_DISABLED
+        logmsg("Revise disabled (--no-revise) — source edits will not auto-apply")
+    elseif !HAVE_REVISE
+        logmsg("Revise FAILED TO LOAD — running without auto-revision: " * first(REVISE_LOAD_ERROR, 500))
+    end
 
     requests = setup_server(dir)
     requests === nothing && return
@@ -402,6 +414,7 @@ function state_toml()
         "kind" => SESSION[] ? "session" : "daemon",
         "proto" => JLD_PROTO,
         "revise" => HAVE_REVISE,
+        "revise_disabled" => REVISE_DISABLED,
     )
     if cur !== nothing
         d["current"] = first(cur.code, 120)

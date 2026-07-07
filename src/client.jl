@@ -240,11 +240,13 @@ function cmd_start(ctx, flags)
 
     startup = get(flags, "startup", String[])
     threads = get(flags, "threads", nothing)
+    norevise = get(flags, "no-revise", false) && !get(flags, "revise", false)
     cfg = Dict{String,Any}(
         "project" => ctx.project, "name" => ctx.name, "julia" => julia,
         "startup" => startup,
     )
     threads !== nothing && (cfg["threads"] = threads)
+    norevise && (cfg["no_revise"] = true)
     cfgtmp = joinpath(ctx.dir, ".config.toml.tmp")
     open(cfgtmp, "w") do io
         TOML.print(io, cfg)
@@ -259,6 +261,7 @@ function cmd_start(ctx, flags)
     sep = Sys.iswindows() ? ";" : ":"
     env["JULIA_LOAD_PATH"] = join(["@", envdir, "@stdlib"], sep)
     delete!(env, "JULIA_PROJECT")
+    norevise ? (env["JLD_NO_REVISE"] = "1") : delete!(env, "JLD_NO_REVISE")
 
     jargs = ["--startup-file=no", "--project=$(ctx.project)"]
     # N default threads for evals + 1 interactive thread for the control plane
@@ -312,7 +315,11 @@ function cmd_start(ctx, flags)
         st = try_ping(ctx.dir)
         if st isa Dict
             info("daemon ready in $(round(time() - t0, digits=1))s (pid $(st["pid"]), julia $(st["julia_version"]))")
-            get(st, "revise", true) || info("WARNING: Revise failed to load in this daemon — source edits will NOT auto-apply (see `jld logs`)")
+            if !get(st, "revise", true)
+                get(st, "revise_disabled", false) ?
+                    info("Revise disabled (--no-revise); source edits will not auto-apply") :
+                    info("WARNING: Revise failed to load in this daemon — source edits will NOT auto-apply (see `jld logs`)")
+            end
             return
         end
         if time() - lastmsg > 5
@@ -330,6 +337,8 @@ function apply_cfg(ctx, flags, cfg)
     cfg === nothing && return ctx
     haskey(flags, "startup") || (flags["startup"] = get(cfg, "startup", String[]))
     !haskey(flags, "threads") && haskey(cfg, "threads") && (flags["threads"] = cfg["threads"])
+    haskey(flags, "no-revise") || haskey(flags, "revise") ||
+        (flags["no-revise"] = get(cfg, "no_revise", false))
     if !haskey(flags, "julia") && !haskey(ENV, "JLD_JULIA")
         j = get(cfg, "julia", "")
         isfile(j) && return Ctx(ctx.project, ctx.name, ctx.id, ctx.dir, j)
@@ -562,7 +571,11 @@ function cmd_status(ctx)
         return
     end
     println("state:    ", st["busy"] ? "busy" : "idle")
-    get(st, "revise", true) || println("revise:   NOT LOADED — source edits will not auto-apply (see `jld logs`)")
+    if !get(st, "revise", true)
+        get(st, "revise_disabled", false) ?
+            println("revise:   disabled (--no-revise)") :
+            println("revise:   NOT LOADED — source edits will not auto-apply (see `jld logs`)")
+    end
     st["busy"] && println("running:  `$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s")
     println("pid:      ", st["pid"])
     println("julia:    ", st["julia_version"])
@@ -876,6 +889,8 @@ flags:
                     added so status/queueing/REPL work during CPU-bound evals)
   --timeout=SECS    eval/run: interrupt after SECS (exit 124); start: wait limit
   --no-autostart    fail instead of autostarting (eval/run)
+  --no-revise       start the daemon without Revise (source edits need `jld restart`);
+                    recorded like --startup — pass --revise to re-enable on restart
 
 exit codes: 0 ok, 1 julia error, 2 usage, 3 daemon unavailable, 124 timeout, 130 interrupted
 
@@ -902,7 +917,7 @@ function parse_cli(args)
                 end
             else
                 k = a[3:end]
-                k in ("no-autostart", "print", "follow", "help", "scratch") || die("unknown flag --$k")
+                k in ("no-autostart", "print", "follow", "help", "scratch", "no-revise", "revise") || die("unknown flag --$k")
                 flags[k] = true
             end
         else

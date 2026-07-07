@@ -75,4 +75,6 @@ one project — set this if another agent may share the directory),
 `--id=ID` (target any existing daemon from `jld list`, any command),
 `--module=M` (eval/run in module Main.M instead of Main),
 `--julia=BIN` / `JLD_JULIA` (daemon's julia, e.g. an in-tree build),
-`--timeout=SECS`.
+`--timeout=SECS`,
+`--no-revise` (daemon without Revise: faster start, but source edits need
+`jld restart`; recorded — pass `--revise` on restart to re-enable).
