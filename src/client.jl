@@ -9,6 +9,9 @@ include(joinpath(@__DIR__, "protocol.jl"))
 
 const JLD_HOME = dirname(@__DIR__)
 const DAEMON_DEPS = ["Revise"]
+# Full Revise stack, pinned to master for unreleased (X.Y-DEV) julias where the
+# registered versions do not precompile.
+const DEV_STACK = ["Revise", "JuliaInterpreter", "LoweredCodeUtils"]
 const SIGTERM_ = Cint(15)
 const SIGKILL_ = Cint(9)
 
@@ -63,6 +66,7 @@ struct Ctx
     id::String
     dir::String
     julia::String
+    checkout::String  # julia source checkout served via a scratch env ("" if none)
 end
 
 function find_project(flag)
@@ -167,7 +171,7 @@ function make_ctx(flags)
        !isfile(joinpath(dir, "config.toml"))
         flags["startup"] = ["Revise.track(Base)"]
     end
-    Ctx(project, name, id, dir, jpath)
+    Ctx(project, name, id, dir, jpath, something(checkout, ""))
 end
 
 # ---- daemon environment (per julia minor version) ----
@@ -195,11 +199,28 @@ function probe_julia(julia, project)
     parts = split(out, '\0')
     length(parts) == 2 || die("unexpected julia probe output: \"$out\"")
     ver, bindir = String(parts[1]), String(parts[2])
-    bin = joinpath(bindir, "julia")
+    bin = joinpath(bindir, Sys.iswindows() ? "julia.exe" : "julia")
     (ver, isfile(bin) ? bin : julia)
 end
 
 minor_of(ver) = (m = match(r"^(\d+)\.(\d+)\.", ver); m === nothing ? die("cannot parse julia version \"$ver\"") : "$(m[1]).$(m[2])")
+
+# Run a subprocess, capturing stdout+stderr together instead of streaming it.
+# Returns (success::Bool, output::String). Used for steps whose output is only
+# interesting when they fail (an expected-and-healed precompile failure on a
+# DEV julia would otherwise dump a misleading backtrace onto the terminal).
+function run_capture(cmd, env)
+    tmp = tempname()
+    p = open(tmp, "w") do io
+        run(pipeline(ignorestatus(setenv(cmd, env)), stdin=devnull, stdout=io, stderr=io))
+    end
+    out = try read(tmp, String) catch; "" end
+    rm(tmp, force=true)
+    (success(p), out)
+end
+
+pkg_add_code(specs) = "using Pkg; Pkg.add($(repr(specs)))"
+dev_add_code() = "using Pkg; Pkg.add([PackageSpec(name=n, rev=\"master\") for n in $(repr(DEV_STACK))])"
 
 # The daemon's deps live in a named depot environment (@jld-v1.X), keyed by
 # julia minor version. Kept out of JLD_HOME so the installation can be
@@ -218,16 +239,21 @@ function ensure_env(julia, version; force=false)
     end
     if force || !isfile(joinpath(envdir, "Manifest.toml")) || !havedeps
         mkpath(envdir)
-        info("setting up daemon environment @jld-v$minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
-        code = "using Pkg; Pkg.add($(repr(DAEMON_DEPS)))"
+        # On an unreleased X.Y-DEV julia the registered Revise stack essentially
+        # never precompiles, so install it from master up front — building a
+        # fresh env this way means the failing registry precompile never runs.
+        isdev = occursin("DEV", version)
+        info(isdev ? "setting up daemon environment @jld-v$minor from master (one-time, unreleased julia)..." :
+                     "setting up daemon environment @jld-v$minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
         # Precompilation is deferred to ensure_revise_loads: it has to happen
         # in the daemon's stacked load context anyway, and a failure there
         # (e.g. a registry stack too old for an unreleased julia) ends with an
         # actionable hint instead of Pkg.add dying in a wall of errors here.
         env = default_julia_env()
         env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
+        code = isdev ? dev_add_code() : pkg_add_code(DAEMON_DEPS)
         p = run(pipeline(ignorestatus(setenv(`$julia --startup-file=no --project=$envdir -e $code`, env)), stdout=stderr, stderr=stderr))
-        success(p) || die("failed to install $(join(DAEMON_DEPS, ", ")) into @jld-v$minor (see errors above)")
+        success(p) || die("failed to set up @jld-v$minor (see errors above)")
     end
     envdir
 end
@@ -236,35 +262,46 @@ end
 # then the jld env): the project's manifest can shadow deps of the jld env,
 # invalidating the caches ensure_env just built, and on unreleased julia
 # versions the re-precompile can fail outright. Probing also pre-builds those
-# caches, so the daemon does not pay for them at startup.
+# caches, so the daemon does not pay for them at startup. Output is captured
+# (returned) rather than streamed: it is only worth showing on failure.
 function revise_loads(julia, project, envdir)
     env = default_julia_env()
     sep = Sys.iswindows() ? ";" : ":"
     env["JULIA_LOAD_PATH"] = join(["@", envdir, "@stdlib"], sep)
     cmd = `$julia --startup-file=no --project=$project -e 'import Revise'`
-    success(run(pipeline(ignorestatus(setenv(cmd, env)), stdin=devnull, stdout=stderr, stderr=stderr)))
+    run_capture(cmd, env)
 end
 
 # The registry's Revise stack lags julia master; the master branches are the
-# working versions for X.Y-DEV julias.
+# working versions for X.Y-DEV julias. Returns (success, output).
 function install_dev_stack(julia, envdir)
     info("installing the Revise stack from master into @$(basename(envdir)) (for unreleased julias)...")
-    code = "using Pkg; Pkg.add([PackageSpec(name=n, rev=\"master\") for n in (\"Revise\", \"JuliaInterpreter\", \"LoweredCodeUtils\")])"
     env = default_julia_env()
     env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
-    success(run(pipeline(ignorestatus(setenv(`$julia --startup-file=no --project=$envdir -e $code`, env)), stdout=stderr, stderr=stderr)))
+    run_capture(`$julia --startup-file=no --project=$envdir -e $(dev_add_code())`, env)
 end
 
 # Turns a daemon that would die at startup into an actionable error — and on
 # unreleased julias, where the registry stack is essentially never loadable,
-# self-heals by reinstalling from master before giving up.
+# self-heals by reinstalling from master before giving up. The probe output is
+# kept back and printed only if every attempt fails, so an expected-and-healed
+# precompile failure does not spill a misleading backtrace onto the terminal.
 function ensure_revise_loads(julia, project, envdir, ver; dev_fallback=true)
-    revise_loads(julia, project, envdir) && return
+    info("verifying the Revise stack loads (precompiling if needed; one-time, may take a few minutes)...")
+    ok, out = revise_loads(julia, project, envdir)
+    ok && return
     if dev_fallback && occursin("DEV", ver)
-        info("the registry's Revise stack does not load on julia $ver (see errors above); retrying from master")
-        install_dev_stack(julia, envdir) && revise_loads(julia, project, envdir) && return
+        info("the registry's Revise stack does not load on julia $ver; reinstalling from master")
+        iok, iout = install_dev_stack(julia, envdir)
+        if iok
+            ok, out = revise_loads(julia, project, envdir)
+            ok && return
+        else
+            out = iout * out
+        end
     end
-    info("Revise cannot load with this julia and project (see errors above); either")
+    isempty(strip(out)) || print(stderr, endswith(out, '\n') ? out : out * "\n")
+    info("Revise cannot load with this julia and project (details above); either")
     info("  - start without it: `jld start --no-revise` (source edits then need `jld restart`),")
     info("  - use a --project whose manifest does not pin conflicting versions of Revise's deps, or")
     info("  - reinstall @jld-v$(minor_of(ver)) from master: `jld setup --dev --julia=$julia --project=$project`")
@@ -352,6 +389,7 @@ function cmd_start(ctx, flags)
         "project" => ctx.project, "name" => ctx.name, "julia" => julia,
         "startup" => startup,
     )
+    isempty(ctx.checkout) || (cfg["checkout"] = ctx.checkout)
     threads !== nothing && (cfg["threads"] = threads)
     norevise && (cfg["no_revise"] = true)
     cfgtmp = joinpath(ctx.dir, ".config.toml.tmp")
@@ -451,7 +489,7 @@ function apply_cfg(ctx, flags, cfg)
         (flags["no-revise"] = get(cfg, "no_revise", false))
     if !haskey(flags, "julia") && !haskey(ENV, "JLD_JULIA")
         j = get(cfg, "julia", "")
-        isfile(j) && return Ctx(ctx.project, ctx.name, ctx.id, ctx.dir, j)
+        isfile(j) && return Ctx(ctx.project, ctx.name, ctx.id, ctx.dir, j, ctx.checkout)
     end
     ctx
 end
@@ -675,7 +713,9 @@ function cmd_status(ctx)
     st = try_ping(ctx.dir)
     dt = daemon_toml(ctx)
     println("id:       ", ctx.id)
-    println("project:  ", ctx.project)
+    isempty(ctx.checkout) ?
+        println("project:  ", ctx.project) :
+        println("project:  ", ctx.checkout, " (checkout; scratch env ", ctx.project, ")")
     if !(st isa Dict)
         pid = dt === nothing ? nothing : get(dt, "pid", nothing)
         if st === :timeout
@@ -731,7 +771,8 @@ function cmd_list(flags=Dict{String,Any}())
         pid = st isa Dict ? string(st["pid"]) :
               st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
         jver = dt !== nothing ? string(get(dt, "julia_version", "-")) : "-"
-        push!(rows, (string(length(rows) + 1), id, state, pid, jver, get(cfg, "project", "?")))
+        proj = haskey(cfg, "checkout") ? string(cfg["checkout"], " (checkout)") : get(cfg, "project", "?")
+        push!(rows, (string(length(rows) + 1), id, state, pid, jver, proj))
     end
     isempty(rows) && (println("no daemons"); return)
     header = ("#", "ID", "STATE", "PID", "JULIA", "PROJECT")
@@ -773,7 +814,8 @@ function ctx_from_known(id)
     dir = joinpath(cache_root(), id)
     cfg = read_toml(joinpath(dir, "config.toml"))
     cfg === nothing && die("unreadable daemon state in $dir")
-    Ctx(get(cfg, "project", ""), get(cfg, "name", ""), id, dir, get(cfg, "julia", "julia"))
+    Ctx(get(cfg, "project", ""), get(cfg, "name", ""), id, dir, get(cfg, "julia", "julia"),
+        get(cfg, "checkout", ""))
 end
 
 # With no project and no id: prefer the daemon `jld eval` would target (the
@@ -972,7 +1014,10 @@ function cmd_setup(ctx, flags=Dict{String,Any}())
     ver, julia = probe_julia(ctx.julia, ctx.project)
     dev = get(flags, "dev", false)
     envdir = ensure_env(julia, ver, force=!dev)
-    dev && (install_dev_stack(julia, envdir) || die("master install failed (see errors above)"))
+    if dev
+        iok, iout = install_dev_stack(julia, envdir)
+        iok || (print(stderr, iout); die("master install failed (see errors above)"))
+    end
     ensure_revise_loads(julia, ctx.project, envdir, ver; dev_fallback=!dev)
     info("daemon environment ready")
 end

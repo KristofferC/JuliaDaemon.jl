@@ -48,6 +48,16 @@ function cap_write!(c::Capture, data::AbstractVector{UInt8})
         append!(c.head, view(data, 1:n))
         i = n + 1
     end
+    rem = length(data) - i + 1
+    rem <= 0 && return
+    # Only the final CAP_TAIL bytes can survive in the ring; for a large write
+    # skip straight to them with one bulk copy instead of spinning per-byte.
+    if rem >= CAP_TAIL
+        copyto!(c.tail, 1, data, length(data) - CAP_TAIL + 1, CAP_TAIL)
+        c.tstart = 0
+        c.tcount = CAP_TAIL
+        return
+    end
     while i <= length(data)
         c.tail[(c.tstart + c.tcount) % CAP_TAIL + 1] = data[i]
         c.tcount == CAP_TAIL ? (c.tstart = (c.tstart + 1) % CAP_TAIL) : (c.tcount += 1)

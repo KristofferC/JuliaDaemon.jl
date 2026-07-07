@@ -28,7 +28,10 @@ are applied automatically before each request. Warm requests cost ~0.2s.
   means the output came from STALE code — fix the file and rerun, or
   `jld restart` if it persists.
 - Exit codes are honest: 0 ok, 1 julia error (backtrace on stderr),
-  3 daemon unreachable, 124 timeout, 130 interrupted.
+  2 usage error, 3 daemon unreachable, 124 timeout, 130 interrupted.
+  Judge success by the exit code and the final `jld: daemon ready` line —
+  not by `ERROR`/backtrace text scrolling past during a one-time setup, which
+  may be an expected-and-healed step (e.g. reinstalling Revise from master).
 
 ## Joining a human's live session
 
@@ -63,10 +66,15 @@ from inside it use the in-tree julia, a jld-managed scratch environment, and
 - `--julia=BIN` overrides the binary; `--startup=...` on the first `jld start`
   replaces the default `Revise.track(Base)` (recorded for restarts).
 - On unreleased julia versions (X.Y-DEV) the registry's Revise stack usually
-  fails to precompile; `jld start` detects this and automatically reinstalls
-  the stack from master into `@jld-vX.Y` (same as `jld setup --dev`). Expect
-  the first start on a fresh env to take a few minutes; only if the master
-  stack also fails does it stop with alternatives (e.g. `--no-revise`).
+  fails to precompile; jld installs the stack from master into `@jld-vX.Y`
+  instead (same as `jld setup --dev`), so the failing registry precompile is
+  never run or shown. Expect the first start on a fresh env to take a few
+  minutes; only if the master stack also fails does it stop with alternatives
+  (e.g. `--no-revise`), printing the captured error then.
+- The first `jld eval`/`jld run` in a not-yet-started daemon pays this whole
+  setup, interleaving its output with your result. When you care about reading
+  the result cleanly (or the env is fresh), run `jld start` first — it prints
+  only progress plus a final `daemon ready`, then evals come back clean.
 
 ## Interrupting
 
