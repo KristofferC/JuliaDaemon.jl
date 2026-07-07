@@ -17,7 +17,11 @@ function serve(; name::AbstractString="repl")
     if !isdefined(Main, :JLDDaemon)
         Base.include(Main, joinpath(@__DIR__, "daemon.jl"))
     end
-    Base.invokelatest(Main.JLDDaemon.serve_session; name)
+    # Both binding lookups must also happen in the latest world: Main.JLDDaemon
+    # was created by the include above (julia 1.12 binding world-age).
+    Base.invokelatest() do
+        Main.JLDDaemon.serve_session(; name)
+    end
 end
 
 function (@main)(args)
