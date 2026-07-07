@@ -2,180 +2,199 @@
 
 [![CI](https://github.com/KristofferC/JuliaDaemon.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/KristofferC/JuliaDaemon.jl/actions/workflows/ci.yml)
 
-Persistent, Revise-enabled Julia daemons — one per project — driveable from the
-command line. Built for agentic workflows: package load and compile latency is
-paid once, then each `jld eval`/`jld run` costs ~0.2s, streams output live,
-and returns honest exit codes.
+`jld` keeps a Julia process alive for each of your projects, with
+[Revise](https://github.com/timholy/Revise.jl) loaded, and lets you run code
+in it from the shell. Package loading and compilation happen once, when the
+daemon first starts. After that a `jld eval` or `jld run` takes a couple
+hundred milliseconds, streams output as it is produced, and the exit code
+tells you whether the code ran, threw, or never reached a daemon at all.
+
+The main audience is coding agents, which love to shell out `julia -e` and
+would otherwise pay the full startup cost on every call, but it works just
+as well by hand.
 
 ```sh
 cd MyPkg
-jld eval 'using MyPkg; MyPkg.foo()'   # autostarts the daemon, loads MyPkg
+jld eval 'using MyPkg; MyPkg.foo()'   # first call starts the daemon and loads MyPkg
 # edit src/…
-jld run scratch.jl                     # Revise applied your edit; no reload
-jld connect                            # attach your own REPL to the same session
+jld run scratch.jl                    # the edit is already live, nothing reloads
+jld connect                           # open your own REPL into the same session
 ```
 
 ## How it works
 
-- `jld` resolves the project (`--project`, `JULIA_PROJECT`, or nearest
-  `Project.toml`) and keys a daemon on it. Separate projects/worktrees get
-  separate daemons automatically; `--name`/`JLD_NAME` separates daemons
-  sharing one project.
-- The daemon runs `julia --project=<proj>` with Revise loaded (from a private
-  environment stacked on `JULIA_LOAD_PATH` — your project's `Project.toml` is
-  never touched). Every request calls `Revise.revise()` first and reports
-  failures (`jld:` warnings) instead of silently running stale code.
-- Requests evaluate into `Main` with REPL soft-scope semantics; state (and
-  `ans`) persists across calls. Evals are serialized; concurrent requests
-  queue.
-- `jld connect` attaches an interactive REPL that shares `Main` with the
-  agent: inspect what it built, and vice versa. The remote prompt speaks the
-  same framed text protocol as everything else — no serialization, so any
-  julia version can attach to any daemon, and completions travel on their own
-  connection (answered by the daemon's control thread, even mid-eval).
-- Interrupts are soft (`schedule(task, InterruptException())`): they land at
-  yield points. A hot loop that never yields cannot
-  be interrupted — `jld kill` it; the next eval autostarts a fresh daemon.
+When you run `jld` it figures out which project you are in (`--project`,
+`JULIA_PROJECT`, or the nearest `Project.toml`) and talks to that project's
+daemon, starting one if needed. Separate projects and worktrees get separate
+daemons on their own, and `--name` gives you several for the same project,
+for example one per agent.
+
+The daemon is an ordinary `julia --project=<proj>` with Revise loaded beside
+it, from a private environment stacked onto `JULIA_LOAD_PATH`, so your
+`Project.toml` is never touched. Every request runs `Revise.revise()` first.
+If an edit could not be applied you get a `jld:` warning instead of silently
+stale results.
+
+Code evaluates into `Main` with the REPL's soft-scope rules. Variables stay
+around between calls, `ans` is set, and requests run one at a time: if the
+daemon is busy, the next request waits its turn and says so.
+
+`jld connect` opens a REPL into the same session, so you can poke at what an
+agent has built up, and it can see what you do. The wire protocol is
+length-framed plain text with no serialization, which means any client julia
+can talk to any daemon julia, and tab completion keeps working even while
+the daemon is busy computing.
+
+Interrupts are soft: the eval task gets an `InterruptException` at its next
+yield point. A hot loop that never yields cannot be stopped that way.
+`jld kill` it and let the next eval start a fresh daemon.
 
 ## Commands
 
-`jld --help` prints the same reference. `eval`, `run`, and `connect`
-autostart the daemon; the rest act on an existing one.
+`jld --help` prints the same reference. `eval`, `run`, and `connect` start
+the daemon if it isn't running; everything else expects one.
 
 ### Running code
 
-- `jld eval '<code>'` — evaluate in the daemon's `Main`. Reads stdin when no
-  argument is given, so heredocs work. Output streams live, the result is
-  displayed REPL-style, and `ans` is set.
-- `jld run <file.jl>` — `include()` a file. Each request runs with the daemon
-  `cd`'d to your shell's cwd, so relative paths behave as expected.
+- `jld eval '<code>'` — run code in the daemon's `Main`. With no argument it
+  reads stdin, so heredocs work.
+- `jld run <file.jl>` — `include()` a file. The daemon changes to your
+  shell's directory for the duration of the request, so relative paths mean
+  what you think they mean.
 
-Both accept:
+Both take:
 
-- `--scratch` — evaluate in a fresh throwaway module that sees `Main`'s
-  bindings but keeps nothing; everything it defines is released afterwards.
-  Use it for exploration so `Main` stays clean.
-- `--module=M` — evaluate in `Main.M` instead of `Main` (created on demand;
-  not combinable with `--scratch`).
-- `--timeout=SECS` — interrupt the eval after SECS and exit 124. The daemon
-  and its compile state survive.
-- `--no-autostart` — fail (exit 3) instead of starting a daemon.
+- `--scratch` — run in a throwaway module that can read `Main` but leaves
+  nothing behind. Good for exploration you don't want polluting the session.
+- `--module=M` — run inside `Main.M`, created if needed. Can't be combined
+  with `--scratch`.
+- `--timeout=SECS` — give up after SECS. The eval is interrupted, you get
+  exit code 124, and the daemon keeps its compile state.
+- `--no-autostart` — fail with exit 3 rather than starting a daemon.
 
 ### Lifecycle
 
-- `jld start` — pre-warm. `--startup='using MyPkg'` runs code at boot
-  (repeatable) and is recorded so `restart` replays it. `--threads=N` sets
-  eval threads (an interactive thread is always added on top — that's why
-  `status`, `stacks`, and `connect` keep working during a CPU-bound eval).
-  `--timeout` bounds the wait for the daemon to come up.
-- `jld restart` — stop and start from scratch, keeping the recorded startup
-  code. Needed after struct layout redefinitions (on julia < 1.12).
-- `jld interrupt` — interrupt the current eval at its next yield point; the
-  daemon survives.
-- `jld stop` — graceful shutdown. Refused for served sessions (that would be
-  someone's live REPL).
-- `jld kill` — SIGKILL. Not session-guarded; check `jld list` before using it
-  on a daemon you didn't start.
-- `jld gc` — remove state (config, log, transcript) of dead daemons.
+- `jld start` — start the daemon ahead of time. `--startup='using MyPkg'`
+  runs code at boot (repeat the flag for more) and is remembered, so a later
+  `restart` runs it again. `--threads=N` sets the number of eval threads;
+  one extra interactive thread is always added, which is what keeps `status`
+  and `connect` responsive while an eval is hogging the CPU. `--timeout`
+  caps how long to wait for the daemon to come up.
+- `jld restart` — stop and start again with the remembered options. This is
+  what you want after redefining a struct on julia < 1.12.
+- `jld interrupt` — interrupt the current eval at its next yield point. The
+  daemon stays up.
+- `jld stop` — shut down cleanly. Refused if the target is somebody's
+  interactive session (see below).
+- `jld kill` — SIGKILL, no questions asked. Unlike `stop` this is not
+  refused for sessions, so glance at `jld list` before using it on a daemon
+  you didn't start.
+- `jld gc` — clean up config, logs and transcripts left behind by dead
+  daemons.
 
-### Inspecting
+### Looking around
 
-- `jld status` — state of the daemon this context targets: busy/idle, the
-  current eval and how long it has run, pid, julia version, uptime, and a
-  warning if Revise failed to load. Works mid-eval.
-- `jld list` — all daemons; `*` marks the one the current context targets.
-- `jld logs [-f]` — daemon log (`-f` follows).
-- `jld transcript [id] [-f]` — the full session history: every input and
-  output evaluated in the daemon (`jld eval`/`run` and REPL input alike),
-  truncated per entry. The fastest way to pick up the context of a running
-  session.
-- `jld stacks [id]` — task backtraces of what the daemon is executing right
-  now; useful before deciding whether to `interrupt` or `kill`.
+- `jld status` — what the daemon is up to: busy or idle, what it is running
+  and for how long, pid, julia version, uptime, and a warning if Revise
+  didn't load. Works even mid-eval.
+- `jld list` — every daemon, with a `*` on the one your current directory
+  targets.
+- `jld logs [-f]` — the daemon's log. `-f` follows it.
+- `jld transcript [id] [-f]` — everything that has been evaluated in the
+  session, inputs and outputs, from `jld eval` and attached REPLs alike
+  (long outputs are truncated). If you are joining a session someone else
+  has been working in, read this first.
+- `jld stacks [id]` — backtraces of what the daemon's tasks are doing right
+  now. Useful for deciding between `interrupt` and `kill`.
 
 ### Interactive
 
-- `jld connect [id]` — attach a REPL (`julia@<id>>` prompt) to a daemon;
-  backspace switches to a local `julia>` prompt, Ctrl-D exits. `--print`
-  prints the socket path instead of attaching.
-- `jld eval-repl '<code>'` — paste code into the attached `connect` REPL
-  exactly as if typed there: echoed at the prompt, evaluated, `ans` set.
-  Lets an agent show results in the human's REPL.
+- `jld connect [id]` — attach a REPL; the prompt reads `julia@<id>>`.
+  Backspace on an empty line drops to a local `julia>` prompt, Ctrl-D exits.
+  `--print` prints the socket path instead of attaching.
+- `jld eval-repl '<code>'` — type into the attached REPL from the outside:
+  the code is echoed at the prompt, evaluated there, and sets `ans`, exactly
+  as if typed by hand. This is how an agent can show you something in your
+  own REPL.
 
-### Installation
+### Setup
 
-- `jld setup` — (re)install the daemon environment for the selected julia.
-  Normally automatic on first use.
-- `jld install` — install the agent skill (see [Install](#install)).
+- `jld setup` — (re)install the daemon environment for the chosen julia.
+  Happens automatically on first use, so you rarely need it.
+- `jld install` — install the agent skill, see [Install](#install).
 
 ### Exit codes
 
-0 ok, 1 julia error, 2 usage, 3 daemon unavailable, 124 timeout,
-130 interrupted.
+0 the code ran, 1 it threw (backtrace on stderr), 2 you called `jld` wrong,
+3 the daemon can't be reached, 124 timed out, 130 interrupted.
 
 ## Flags
 
-All commands accept the flags that select a daemon; the eval-specific ones
-are listed above.
+These work with every command; the eval-specific ones are listed above.
 
-| Flag | Env | Meaning |
-|------|-----|---------|
-| `--project=PATH` | `JULIA_PROJECT` | project to serve (default: nearest `Project.toml`, else the default environment — like plain julia) |
-| `--name=NAME` | `JLD_NAME` | distinct daemon for the same project (parallel agents, throwaway experiments) |
-| `--id=ID` | | target an existing daemon: full id, any unique substring, or its row number in `jld list`; works with every command |
-| `--julia=BIN` | `JLD_JULIA` | julia executable for the daemon |
-| `--startup=CODE` | | code to run at daemon boot (repeatable; `start`/`restart`) |
-| `--threads=N` | | daemon eval threads (default 1; +1 interactive thread always) |
-| `--timeout=SECS` | | eval/run: interrupt after SECS; start: wait limit |
-| `--module=M` / `--scratch` | | eval/run target module (see above) |
-| `--no-autostart` | | eval/run: fail instead of autostarting |
-| `--no-revise` | | start the daemon without Revise — source edits then need `jld restart`. Recorded like `--startup`; pass `--revise` to re-enable on restart. `status` shows `revise: disabled` |
-| `-f` | | follow (`logs`, `transcript`) |
+- `--project=PATH` — which project to serve. Defaults like plain julia:
+  `JULIA_PROJECT`, else the nearest `Project.toml`, else the default
+  environment.
+- `--name=NAME` (env `JLD_NAME`) — a separate daemon for the same project.
+  Handy when several agents share a directory.
+- `--id=ID` — target a specific daemon from `jld list`: the full id, any
+  unique part of it, or its row number.
+- `--julia=BIN` (env `JLD_JULIA`) — which julia the daemon runs.
+- `--startup=CODE` — code to run at boot; may be repeated.
+- `--threads=N` — eval threads (default 1, plus the interactive thread).
+- `--timeout=SECS` — for eval/run, interrupt after SECS; for start, how long
+  to wait.
+- `--no-revise` — run the daemon without Revise. Source edits then need a
+  `jld restart` to be picked up, and `status` will say so. The choice is
+  remembered like `--startup`; pass `--revise` to a later restart to switch
+  back.
 
-Outside any project, commands that act on a daemon (`connect`, `stop`,
-`restart`, `logs`, `transcript`, …) fall back to the single running daemon
-when there is exactly one, so `--id` is only needed to disambiguate.
-`JLD_DEBUG=1` traces client-side steps.
+Outside a project, commands that act on a daemon (`connect`, `stop`, `logs`,
+`transcript`, …) simply use the one running daemon if there is exactly one,
+so you mostly don't need `--id`. Set `JLD_DEBUG=1` to watch what the client
+is doing step by step.
 
 ## Serving an existing session
 
-A running interactive session can itself become a daemon:
+Your interactive REPL can be a daemon too:
 
 ```julia
 julia> using JuliaDaemon
 julia> JuliaDaemon.serve()        # or serve(name="mysession")
 ```
 
-It appears in `jld list` (state `idle/repl`), and agents can `jld --id=<id>
-eval` into it, read its transcript (which includes your typed inputs),
-inspect its stacks, and `jld eval-repl` paste into your prompt. `jld stop` is
-refused for sessions — exit the REPL to end it. Revise is optional here and
-used when loadable in the session.
+It shows up in `jld list` (state `idle/repl`), and from there agents can
+eval into it with `jld --id=<id> eval`, read the transcript (your typed
+input included), look at its stacks, and paste into your prompt with
+`jld eval-repl`. `jld stop` refuses to touch sessions; you end one by
+exiting the REPL. Revise is used if the session has it and skipped
+otherwise.
 
 ## Julia versions
 
-`--julia=BIN` (or `JLD_JULIA`) picks the daemon's julia — e.g. an in-tree
-`usr/bin/julia` build. Daemon dependencies are installed on first use into a
-named depot environment per minor version (`@jld-v1.12`, …), so the jld
-installation itself can be read-only. The wire protocol is plain text, so the `jld` CLI and `jld connect` work
-against daemons of any version (handy when the dev build is broken mid-rebase:
-`status`/`logs`/`stop` still work).
+`--julia=BIN` (or `JLD_JULIA`) decides which julia the daemon runs. An
+in-tree `usr/bin/julia` build works fine. The daemon's own dependency
+(Revise) installs on first use into a small named environment per minor
+version (`@jld-v1.12`, …), so the jld installation itself can live on a
+read-only path. And since the protocol is plain text, the CLI and
+`jld connect` work across versions. When your dev build is broken
+mid-rebase, `status`, `logs` and `stop` still work.
 
 ## Install
 
-As a Pkg app (julia 1.12+; puts the `jld` shim in `~/.julia/bin`, keep it on PATH):
+As a Pkg app (julia 1.12 or newer; the `jld` shim lands in `~/.julia/bin`,
+keep that on PATH):
 
 ```
 pkg> app add <this repo url>
 $ jld install        # installs the agent skill (SKILL.md)
 ```
 
-`install` copies the skill into `~/.agents/skills/` (the cross-tool Agent
-Skills location, read by opencode, Gemini CLI, …) and into the skills dirs
-of installed agents that only read their own (`~/.claude`, `~/.codex`).
-From a clone, `JuliaDaemon.jl/bin/jld install` also symlinks
-`~/.local/bin/jld` if `jld` is not already on PATH.
+`install` copies the skill into `~/.agents/skills/` (the shared Agent Skills
+location that opencode, Gemini CLI and others read) and into the skill
+directories of agents that only read their own (`~/.claude`, `~/.codex`).
+Run from a clone, `bin/jld install` also symlinks `~/.local/bin/jld` if
+nothing named `jld` is on PATH yet.
 
-The daemon dependency (Revise) installs itself on first use.
-
-State lives in `~/.cache/julia-daemon/<id>/` (socket, config, log).
-Test: `test/e2e.sh`.
+State lives in `~/.cache/julia-daemon/<id>/` (config, log, transcript).
+The tests are in `test/e2e.sh`.
