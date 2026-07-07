@@ -147,10 +147,15 @@ checkout "named daemons are isolated" "false" "$out"
 
 # ---- --no-revise (the iso daemon autostarted with it) ----
 
-out=$($JLD --project="$WORK/ToyPkg" --name=iso status 2>&8)
-checkout "no-revise: status shows disabled" "disabled (--no-revise)" "$out"
 out=$($JLD --project="$WORK/ToyPkg" --name=iso eval 'isdefined(Main, :Revise)' 2>&8)
 checkout "no-revise: Revise not loaded" "false" "$out"
+# A ping right after boot can transiently fail on slow runners; retry briefly.
+for i in 1 2 3 4 5; do
+    out=$($JLD --project="$WORK/ToyPkg" --name=iso status 2>&8)
+    [[ "$out" == *"revise:"* ]] && break
+    sleep 1
+done
+checkout "no-revise: status shows disabled" "disabled (--no-revise)" "$out"
 $JLD --project="$WORK/ToyPkg" --name=iso restart >/dev/null 2>&8
 out=$($JLD --project="$WORK/ToyPkg" --name=iso eval 'isdefined(Main, :Revise)' 2>&8)
 checkout "no-revise: restart keeps it" "false" "$out"
