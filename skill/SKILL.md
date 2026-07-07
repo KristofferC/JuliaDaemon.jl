@@ -17,7 +17,8 @@ are applied automatically before each request. Warm requests cost ~0.2s.
 - The daemon autostarts on first use (that request pays the package load).
   The project is already active — never put `Pkg.activate(...)` in scripts.
   With no Project.toml anywhere upwards, the daemon serves the default user
-  environment (like plain julia).
+  environment (like plain julia) — except in a julia source checkout, which
+  is served directly (see "Working on Julia itself").
 - If `--startup` code fails at boot, the daemon stays up without it and
   `jld start`/`jld status` say so — rerun the code via `jld eval`, or fix
   and `jld restart`.
@@ -50,24 +51,22 @@ be handled by Revise on Julia ≥1.12; on older Julia they need `jld restart`.
 
 ## Working on Julia itself (Base/stdlib)
 
-In a julia checkout with an in-tree build, Base edits apply live — no `make`:
+In a julia checkout with an in-tree build (`usr/bin/julia`), Base edits apply
+live — no `make`. jld detects the checkout automatically: bare commands run
+from inside it use the in-tree julia, a jld-managed scratch environment, and
+`Revise.track(Base)` at boot — no setup, no `--id`:
 
-    mkdir -p /tmp/jld-base && touch /tmp/jld-base/Project.toml
-    jld start --julia=/path/to/julia/usr/bin/julia \
-        --project=/tmp/jld-base --startup='Revise.track(Base)'   # prints the daemon id
-    jld --id=<id> eval 'Base.foo(...)'   # edits under base/ apply per request
+    jld eval 'Base.foo(...)'   # edits under base/ apply per request, including
+                               # edits made before the daemon started (anything
+                               # newer than the last `make`)
 
-- The julia repo has no top-level Project.toml, so bare `jld` commands run
-  from the checkout target the *default user environment*, not this daemon —
-  pass `--id=<id>` (printed by start, shown by `jld list`) or the same
-  `--project` on every command, `eval` included.
-- Keep the scratch Project.toml empty — a populated environment's manifest
-  can pin different versions of Revise's own deps, which forces (and on a
-  -DEV julia can break) re-precompilation.
-- On unreleased julia versions (X.Y-DEV) the registry's Revise stack may not
-  precompile at all; `jld start` detects this and prints the fix:
-  `jld setup --dev --julia=... --project=...` installs the stack from
-  master into `@jld-vX.Y` (or start with `--no-revise`).
+- `--julia=BIN` overrides the binary; `--startup=...` on the first `jld start`
+  replaces the default `Revise.track(Base)` (recorded for restarts).
+- On unreleased julia versions (X.Y-DEV) the registry's Revise stack usually
+  fails to precompile; `jld start` detects this and automatically reinstalls
+  the stack from master into `@jld-vX.Y` (same as `jld setup --dev`). Expect
+  the first start on a fresh env to take a few minutes; only if the master
+  stack also fails does it stop with alternatives (e.g. `--no-revise`).
 
 ## Interrupting
 

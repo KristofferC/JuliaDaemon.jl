@@ -112,19 +112,62 @@ function default_env_project(jpath)
     realpath(path)
 end
 
+# A julia source checkout has no top-level Project.toml; recognize it so bare
+# commands from inside it serve the checkout instead of the default
+# environment: in-tree build, scratch environment, Revise.track(Base) at boot.
+function find_checkout()
+    d = pwd()
+    while true
+        if isfile(joinpath(d, "base", "Base.jl")) && isfile(joinpath(d, "src", "julia.h"))
+            return realpath(d)
+        end
+        nd = dirname(d)
+        nd == d && return nothing
+        d = nd
+    end
+end
+
+# Scratch project for a checkout daemon, keyed by checkout path. Kept empty on
+# purpose: a populated manifest can pin different versions of Revise's own
+# deps, which forces (and on a -DEV julia can break) re-precompilation.
+function checkout_env(checkout)
+    slug = replace(basename(checkout), r"[^A-Za-z0-9_.-]" => "-")
+    dir = joinpath(cache_root(), "checkout-envs", string(slug, "-", bytes2hex(sha1(checkout))[1:8]))
+    mkpath(dir)
+    toml = joinpath(dir, "Project.toml")
+    isfile(toml) || touch(toml)
+    realpath(dir)
+end
+
 function make_ctx(flags)
     julia = get(flags, "julia", get(ENV, "JLD_JULIA", "julia"))
-    jpath = Sys.which(julia)
-    jpath === nothing && die("julia executable not found: $julia")
     explicit = haskey(flags, "julia") || !isempty(get(ENV, "JLD_JULIA", ""))
     project = find_project(get(flags, "project", nothing))
+    checkout = project === nothing ? find_checkout() : nothing
+    if checkout !== nothing
+        if !explicit
+            intree = joinpath(checkout, "usr", "bin", Sys.iswindows() ? "julia.exe" : "julia")
+            isfile(intree) || die("julia checkout at $checkout has no in-tree build (usr/bin/julia); build it first, or pass --julia=BIN")
+            julia = intree
+        end
+        project = checkout_env(checkout)
+    end
+    jpath = Sys.which(julia)
+    jpath === nothing && die("julia executable not found: $julia")
     project === nothing && (project = default_env_project(explicit ? jpath : nothing))
     project === nothing && die("no project found and cannot resolve a default environment; pass --project=<path>")
     name = get(flags, "name", get(ENV, "JLD_NAME", ""))
     slug = replace(basename(project), r"[^A-Za-z0-9_.-]" => "-")
     h = bytes2hex(sha1(project * "\0" * name))[1:8]
     id = isempty(name) ? "$slug-$h" : "$slug-$name-$h"
-    Ctx(project, name, id, joinpath(cache_root(), id), jpath)
+    dir = joinpath(cache_root(), id)
+    # Fresh checkout daemon: track Base by default (recorded at start, so an
+    # explicit --startup or a recorded config takes precedence from then on).
+    if checkout !== nothing && !haskey(flags, "startup") && !get(flags, "no-revise", false) &&
+       !isfile(joinpath(dir, "config.toml"))
+        flags["startup"] = ["Revise.track(Base)"]
+    end
+    Ctx(project, name, id, dir, jpath)
 end
 
 # ---- daemon environment (per julia minor version) ----
@@ -189,24 +232,42 @@ function ensure_env(julia, version; force=false)
     envdir
 end
 
-# Check that Revise loads in the daemon's exact load context (project first,
+# Probe that Revise loads in the daemon's exact load context (project first,
 # then the jld env): the project's manifest can shadow deps of the jld env,
 # invalidating the caches ensure_env just built, and on unreleased julia
-# versions the re-precompile can fail outright. Probing here also pre-builds
-# those caches, and turns a daemon that would die at startup into an
-# actionable error.
-function ensure_revise_loads(julia, project, envdir, ver)
+# versions the re-precompile can fail outright. Probing also pre-builds those
+# caches, so the daemon does not pay for them at startup.
+function revise_loads(julia, project, envdir)
     env = default_julia_env()
     sep = Sys.iswindows() ? ";" : ":"
     env["JULIA_LOAD_PATH"] = join(["@", envdir, "@stdlib"], sep)
     cmd = `$julia --startup-file=no --project=$project -e 'import Revise'`
-    p = run(pipeline(ignorestatus(setenv(cmd, env)), stdin=devnull, stdout=stderr, stderr=stderr))
-    success(p) && return
+    success(run(pipeline(ignorestatus(setenv(cmd, env)), stdin=devnull, stdout=stderr, stderr=stderr)))
+end
+
+# The registry's Revise stack lags julia master; the master branches are the
+# working versions for X.Y-DEV julias.
+function install_dev_stack(julia, envdir)
+    info("installing the Revise stack from master into @$(basename(envdir)) (for unreleased julias)...")
+    code = "using Pkg; Pkg.add([PackageSpec(name=n, rev=\"master\") for n in (\"Revise\", \"JuliaInterpreter\", \"LoweredCodeUtils\")])"
+    env = default_julia_env()
+    env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
+    success(run(pipeline(ignorestatus(setenv(`$julia --startup-file=no --project=$envdir -e $code`, env)), stdout=stderr, stderr=stderr)))
+end
+
+# Turns a daemon that would die at startup into an actionable error — and on
+# unreleased julias, where the registry stack is essentially never loadable,
+# self-heals by reinstalling from master before giving up.
+function ensure_revise_loads(julia, project, envdir, ver; dev_fallback=true)
+    revise_loads(julia, project, envdir) && return
+    if dev_fallback && occursin("DEV", ver)
+        info("the registry's Revise stack does not load on julia $ver (see errors above); retrying from master")
+        install_dev_stack(julia, envdir) && revise_loads(julia, project, envdir) && return
+    end
     info("Revise cannot load with this julia and project (see errors above); either")
     info("  - start without it: `jld start --no-revise` (source edits then need `jld restart`),")
     info("  - use a --project whose manifest does not pin conflicting versions of Revise's deps, or")
-    info("  - fix @jld-v$(minor_of(ver)): on an unreleased julia the registry's Revise stack may be")
-    info("    too old — `jld setup --dev` installs it from master")
+    info("  - reinstall @jld-v$(minor_of(ver)) from master: `jld setup --dev --julia=$julia --project=$project`")
     exit(1)
 end
 
@@ -407,8 +468,9 @@ function ensure_running(ctx, flags)
     st === :timeout && return
     get(flags, "no-autostart", false) && die("daemon not running (autostart disabled)", 3)
     # Autostarting the default-environment daemon while others run is easy to
-    # do by accident (e.g. forgetting --id in a project-less checkout); say so.
-    if !haskey(flags, "id") && find_project(get(flags, "project", nothing)) === nothing
+    # do by accident (e.g. forgetting --id in a project-less directory); say so.
+    if !haskey(flags, "id") && find_project(get(flags, "project", nothing)) === nothing &&
+       find_checkout() === nothing
         others = filter(id -> id != ctx.id && ping_alive(joinpath(cache_root(), id)), known_ids())
         isempty(others) ||
             info("no project here — autostarting a default-environment daemon; other running daemons: $(join(others, ", ")) (`--id` targets one)")
@@ -910,15 +972,8 @@ function cmd_setup(ctx, flags=Dict{String,Any}())
     ver, julia = probe_julia(ctx.julia, ctx.project)
     dev = get(flags, "dev", false)
     envdir = ensure_env(julia, ver, force=!dev)
-    if dev
-        info("installing the Revise stack from master into @jld-v$(minor_of(ver)) (for unreleased julias)...")
-        code = "using Pkg; Pkg.add([PackageSpec(name=n, rev=\"master\") for n in (\"Revise\", \"JuliaInterpreter\", \"LoweredCodeUtils\")])"
-        env = default_julia_env()
-        env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
-        p = run(pipeline(ignorestatus(setenv(`$julia --startup-file=no --project=$envdir -e $code`, env)), stdout=stderr, stderr=stderr))
-        success(p) || die("master install failed (see errors above)")
-    end
-    ensure_revise_loads(julia, ctx.project, envdir, ver)
+    dev && (install_dev_stack(julia, envdir) || die("master install failed (see errors above)"))
+    ensure_revise_loads(julia, ctx.project, envdir, ver; dev_fallback=!dev)
     info("daemon environment ready")
 end
 
@@ -948,8 +1003,9 @@ commands:
   stacks [id]       show task backtraces of what the daemon is currently executing
   logs [-f]         show daemon log (last 100 lines; --lines=N or --all for more)
   setup             (re)install the daemon environment for the selected julia;
-                    --dev installs the Revise stack from master (for unreleased
-                    X.Y-DEV julias where the registry versions do not precompile)
+                    --dev installs the Revise stack from master (start falls back
+                    to this automatically when the registry stack fails to load
+                    on an unreleased X.Y-DEV julia)
   install           install the agent skill into ~/.agents/skills (cross-tool) and the
                     skills dirs of installed agents (~/.claude, ~/.codex);
                     plus a ~/.local/bin/jld symlink if jld is not on PATH
@@ -977,6 +1033,10 @@ exit codes: 0 ok, 1 julia error, 2 usage, 3 daemon unavailable, 124 timeout, 130
 The daemon evaluates into Main with REPL soft-scope semantics and calls
 Revise.revise() before every request, so source edits under the project apply
 without reloading. Struct layout changes require `jld restart`.
+
+Inside a julia source checkout (no Project.toml), jld serves the checkout:
+it uses the in-tree build (usr/bin/julia), an empty scratch environment, and
+runs Revise.track(Base) at boot, so Base/stdlib edits apply live.
 """
 
 function parse_cli(args)
@@ -1018,7 +1078,8 @@ function run_cli(args::Vector{String})
     byid = haskey(flags, "id")
     resolve(posid=nothing) = byid ? ctx_from_id(flags["id"]) :
                              posid !== nothing ? ctx_from_id(posid) : make_ctx(flags)
-    outside_project() = !byid && find_project(get(flags, "project", nothing)) === nothing
+    outside_project() = !byid && find_project(get(flags, "project", nothing)) === nothing &&
+                        find_checkout() === nothing
 
     if cmd == "list"
         cmd_list(flags)

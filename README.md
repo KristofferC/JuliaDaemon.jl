@@ -182,18 +182,19 @@ otherwise.
 
 ## Julia versions
 
-`--julia=BIN` (or `JLD_JULIA`) decides which julia the daemon runs. An
-in-tree `usr/bin/julia` build works fine — with
-`--startup='Revise.track(Base)'` even Base edits apply live. The daemon's
-own dependency (Revise) installs on first use into a small named environment
-per minor version (`@jld-v1.12`, …), so the jld installation itself can live
-on a read-only path. Before starting, jld checks that Revise actually loads
-with that julia and project; on an unreleased julia where the registry's
-Revise stack does not precompile, it tells you what to do instead of
-launching a doomed daemon (usually `jld setup --dev`, which installs the
-Revise stack from master). And since the protocol is plain text, the CLI and
-`jld connect` work across versions. When your dev build is broken
-mid-rebase, `status`, `logs` and `stop` still work.
+`--julia=BIN` (or `JLD_JULIA`) decides which julia the daemon runs. A julia
+source checkout is detected automatically: `jld eval` from inside one serves
+the checkout with its in-tree `usr/bin/julia` build, an empty scratch
+environment, and `Revise.track(Base)` at boot — Base edits apply live, no
+setup. The daemon's own dependency (Revise) installs on first use into a
+small named environment per minor version (`@jld-v1.12`, …), so the jld
+installation itself can live on a read-only path. Before starting, jld
+checks that Revise actually loads with that julia and project; on an
+unreleased julia where the registry's Revise stack does not precompile, it
+reinstalls the stack from master automatically (`jld setup --dev` by hand)
+instead of launching a doomed daemon. And since the protocol is plain text,
+the CLI and `jld connect` work across versions. When your dev build is
+broken mid-rebase, `status`, `logs` and `stop` still work.
 
 ## Install
 
