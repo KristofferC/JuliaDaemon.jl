@@ -75,7 +75,10 @@ Both take:
   with `--scratch`.
 - `--timeout=SECS` — give up after SECS. The eval is interrupted, you get
   exit code 124, and the daemon keeps its compile state.
-- `--no-autostart` — fail with exit 3 rather than starting a daemon.
+- `--no-autostart` — normally `eval` and `run` start a daemon when none is
+  running, and that first call sits through the whole package load. With
+  this flag they fail fast instead (exit 3), for callers that only want an
+  already-warm daemon.
 
 ### Lifecycle
 
