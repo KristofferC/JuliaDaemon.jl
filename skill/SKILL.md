@@ -54,9 +54,9 @@ eval autostarts fresh.
 
 ```
 jld eval '<code>'   evaluate (stdin if no arg; heredocs work)   [autostarts]
-jld eval-scratch '<code>'  eval in a throwaway module that sees Main's bindings and
-                    keeps NOTHING — prefer for exploration so Main stays clean
-                    (also as a flag: `jld run --scratch file.jl`)
+jld eval --scratch '<code>'  eval in a throwaway module that sees Main's bindings
+                    and keeps NOTHING — prefer for exploration so Main stays
+                    clean (also works with run: `jld run --scratch file.jl`)
 jld run <file.jl>   include a file                              [autostarts]
 jld start           pre-warm; --startup='using MyPkg' runs at boot
 jld restart         reload from scratch (keeps recorded --startup)

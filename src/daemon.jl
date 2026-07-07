@@ -667,7 +667,7 @@ function run_request(req)
         end
     else
         source = req.client == "repl" ? "repl" :
-                 req.scratch ? "jld eval-scratch" : "jld eval"
+                 req.scratch ? "jld eval --scratch" : "jld eval"
         input = req.code
     end
     isempty(req.mod) || (source *= " in Main.$(req.mod)")

@@ -372,7 +372,7 @@ function cmd_exec(ctx, kind, arg, flags)
     m = get(flags, "module", "")
     if !isempty(m)
         Base.isidentifier(m) || die("--module must be a simple identifier, got \"$m\"")
-        get(flags, "scratch", false) && die("--module cannot be combined with eval-scratch")
+        get(flags, "scratch", false) && die("--module cannot be combined with --scratch")
         req["module"] = m
     end
     get(flags, "scratch", false) && (req["scratch"] = true)
@@ -838,7 +838,6 @@ usage: jld [flags] <command> [args]
 
 commands:
   eval '<code>'     evaluate code in the daemon (reads stdin if no arg); autostarts
-  eval-scratch '<code>'  shorthand for eval --scratch
   run <file.jl>     include() a file in the daemon; autostarts
   start             start the daemon (pre-warm); --startup='using Foo' to run code at boot
   restart           restart (needed after struct redefinitions); keeps recorded --startup
@@ -978,9 +977,6 @@ function run_cli(args::Vector{String})
     end
     ctx = resolve()
     if cmd == "eval"
-        cmd_exec(ctx, "eval", length(pos) >= 2 ? pos[2] : nothing, flags)
-    elseif cmd == "eval-scratch"
-        flags["scratch"] = true
         cmd_exec(ctx, "eval", length(pos) >= 2 ? pos[2] : nothing, flags)
     elseif cmd == "run"
         cmd_exec(ctx, "include", length(pos) >= 2 ? pos[2] : nothing, flags)

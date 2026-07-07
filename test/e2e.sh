@@ -117,8 +117,8 @@ checkout "run file + state persists" "55" "$out"
 out=$($J --module=Wk eval 'wk_x = 7; wk_x' 2>&8; $J eval 'Main.Wk.wk_x * 2, isdefined(Main, :wk_x)' 2>&8)
 checkout "module workspace" "(14, false)" "$out"
 
-out=$($J eval 'sc_ref = 5;' 2>&8; $J eval-scratch 'sc_tmp = sc_ref * 3' 2>&8; $J eval 'isdefined(Main, :sc_tmp)' 2>&8)
-checkout "eval-scratch sees Main, keeps nothing" "15
+out=$($J eval 'sc_ref = 5;' 2>&8; $J eval --scratch 'sc_tmp = sc_ref * 3' 2>&8; $J eval 'isdefined(Main, :sc_tmp)' 2>&8)
+checkout "eval --scratch sees Main, keeps nothing" "15
 false" "$out"
 
 echo 'rs_tmp = sc_ref + 100; println("run-scratch saw ", rs_tmp)' > "$WORK/rscratch.jl"
