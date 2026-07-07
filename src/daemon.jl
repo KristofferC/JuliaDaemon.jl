@@ -83,6 +83,11 @@ end
 const CURRENT = Ref{Union{Request,Nothing}}(nothing)
 const CURRENT_T0 = Ref(0.0)
 const STARTED = Ref(0.0)
+# True while --startup code runs: the socket already answers pings (so a
+# second daemon is not spawned) but the client keeps waiting for readiness.
+const BOOTING = Ref(false)
+# The --startup snippet that failed at boot, if any; the daemon stays up.
+const STARTUP_ERROR = Ref("")
 const EVAL_TASK = Ref{Task}()
 const STATE_DIR = Ref("")
 const NAME = Ref("")
@@ -240,9 +245,17 @@ function main(args::Vector{String})
 
     HAVE_REVISE && Core.eval(Main, :(import Revise))
 
-    for code in startup
-        logmsg("running startup code: $(first(code, 200))")
-        run_startup(code) || (logmsg("startup code failed, exiting"); exit(1))
+    if !isempty(startup)
+        BOOTING[] = true
+        for code in startup
+            logmsg("running startup code: $(first(code, 200))")
+            if !run_startup(code)
+                STARTUP_ERROR[] = first(code, 120)
+                logmsg("startup code failed; daemon continues without it (rerun via `jld eval`, or fix and `jld restart`)")
+                break
+            end
+        end
+        BOOTING[] = false
     end
 
     # Warm up the completion machinery so the attached REPL's first TAB is
@@ -415,6 +428,8 @@ function state_toml()
         "proto" => JLD_PROTO,
         "revise" => HAVE_REVISE,
         "revise_disabled" => REVISE_DISABLED,
+        "booting" => BOOTING[],
+        "startup_failed" => STARTUP_ERROR[],
     )
     if cur !== nothing
         d["current"] = first(cur.code, 120)

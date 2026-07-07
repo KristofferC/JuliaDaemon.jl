@@ -65,7 +65,7 @@ struct Ctx
     julia::String
 end
 
-function find_project(flag; default_env=false)
+function find_project(flag)
     p = flag !== nothing ? flag : get(ENV, "JULIA_PROJECT", nothing)
     if p !== nothing && !isempty(p)
         if startswith(p, "@") && p != "@."
@@ -87,30 +87,43 @@ function find_project(flag; default_env=false)
             return realpath(d)
         end
         nd = dirname(d)
-        if nd == d
-            default_env || return nothing
-            # No project anywhere upwards: fall back to the default
-            # environment, like plain `julia` does.
-            def = Base.load_path_expand("@v#.#")
-            def === nothing && return nothing
-            path = dirname(def)
-            mkpath(path)
-            return realpath(path)
-        end
+        nd == d && return nothing
         d = nd
     end
 end
 
+# No project anywhere upwards: fall back to the default environment, like
+# plain `julia` does. With an explicit --julia/JLD_JULIA the daemon's version
+# can differ from the client's, so @v#.# must be expanded for the version of
+# `jpath`, not ours; probe the binary in that case.
+function default_env_project(jpath)
+    def = Base.load_path_expand("@v#.#")
+    def === nothing && return nothing
+    path = dirname(def)
+    if jpath !== nothing
+        ver = try
+            readchomp(setenv(`$jpath --startup-file=no -e 'print(VERSION)'`, default_julia_env()))
+        catch
+            die("failed to run $jpath")
+        end
+        path = joinpath(dirname(path), "v" * minor_of(ver))
+    end
+    mkpath(path)
+    realpath(path)
+end
+
 function make_ctx(flags)
-    project = find_project(get(flags, "project", nothing); default_env=true)
+    julia = get(flags, "julia", get(ENV, "JLD_JULIA", "julia"))
+    jpath = Sys.which(julia)
+    jpath === nothing && die("julia executable not found: $julia")
+    explicit = haskey(flags, "julia") || !isempty(get(ENV, "JLD_JULIA", ""))
+    project = find_project(get(flags, "project", nothing))
+    project === nothing && (project = default_env_project(explicit ? jpath : nothing))
     project === nothing && die("no project found and cannot resolve a default environment; pass --project=<path>")
     name = get(flags, "name", get(ENV, "JLD_NAME", ""))
     slug = replace(basename(project), r"[^A-Za-z0-9_.-]" => "-")
     h = bytes2hex(sha1(project * "\0" * name))[1:8]
     id = isempty(name) ? "$slug-$h" : "$slug-$name-$h"
-    julia = get(flags, "julia", get(ENV, "JLD_JULIA", "julia"))
-    jpath = Sys.which(julia)
-    jpath === nothing && die("julia executable not found: $julia")
     Ctx(project, name, id, joinpath(cache_root(), id), jpath)
 end
 
@@ -164,9 +177,37 @@ function ensure_env(julia, version; force=false)
         mkpath(envdir)
         info("setting up daemon environment @jld-v$minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
         code = "using Pkg; Pkg.add($(repr(DAEMON_DEPS)))"
-        run(pipeline(setenv(`$julia --startup-file=no --project=$envdir -e $code`, default_julia_env()), stdout=stderr, stderr=stderr))
+        # Precompilation is deferred to ensure_revise_loads: it has to happen
+        # in the daemon's stacked load context anyway, and a failure there
+        # (e.g. a registry stack too old for an unreleased julia) ends with an
+        # actionable hint instead of Pkg.add dying in a wall of errors here.
+        env = default_julia_env()
+        env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
+        p = run(pipeline(ignorestatus(setenv(`$julia --startup-file=no --project=$envdir -e $code`, env)), stdout=stderr, stderr=stderr))
+        success(p) || die("failed to install $(join(DAEMON_DEPS, ", ")) into @jld-v$minor (see errors above)")
     end
     envdir
+end
+
+# Check that Revise loads in the daemon's exact load context (project first,
+# then the jld env): the project's manifest can shadow deps of the jld env,
+# invalidating the caches ensure_env just built, and on unreleased julia
+# versions the re-precompile can fail outright. Probing here also pre-builds
+# those caches, and turns a daemon that would die at startup into an
+# actionable error.
+function ensure_revise_loads(julia, project, envdir, ver)
+    env = default_julia_env()
+    sep = Sys.iswindows() ? ";" : ":"
+    env["JULIA_LOAD_PATH"] = join(["@", envdir, "@stdlib"], sep)
+    cmd = `$julia --startup-file=no --project=$project -e 'import Revise'`
+    p = run(pipeline(ignorestatus(setenv(cmd, env)), stdin=devnull, stdout=stderr, stderr=stderr))
+    success(p) && return
+    info("Revise cannot load with this julia and project (see errors above); either")
+    info("  - start without it: `jld start --no-revise` (source edits then need `jld restart`),")
+    info("  - use a --project whose manifest does not pin conflicting versions of Revise's deps, or")
+    info("  - fix @jld-v$(minor_of(ver)): on an unreleased julia the registry's Revise stack may be")
+    info("    too old — `jld setup --dev` installs it from master")
+    exit(1)
 end
 
 # ---- daemon state ----
@@ -211,10 +252,14 @@ end
 
 log_path(ctx) = joinpath(ctx.dir, "daemon.log")
 
+# Captured precompile progress is full of terminal control sequences
+# (\e[0K etc.); strip them when reading the log back.
+strip_ansi(s) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
+
 function log_tail(ctx, n)
     isfile(log_path(ctx)) || return ""
     lines = readlines(log_path(ctx))
-    join(lines[max(1, end-n+1):end], "\n") * "\n"
+    join(strip_ansi.(lines[max(1, end-n+1):end]), "\n") * "\n"
 end
 
 # ---- commands ----
@@ -241,6 +286,7 @@ function cmd_start(ctx, flags)
     startup = get(flags, "startup", String[])
     threads = get(flags, "threads", nothing)
     norevise = get(flags, "no-revise", false) && !get(flags, "revise", false)
+    norevise || ensure_revise_loads(julia, ctx.project, envdir, ver)
     cfg = Dict{String,Any}(
         "project" => ctx.project, "name" => ctx.name, "julia" => julia,
         "startup" => startup,
@@ -313,17 +359,20 @@ function cmd_start(ctx, flags)
             exit(1)
         end
         st = try_ping(ctx.dir)
-        if st isa Dict
+        if st isa Dict && !get(st, "booting", false)
             info("daemon ready in $(round(time() - t0, digits=1))s (pid $(st["pid"]), julia $(st["julia_version"]))")
             if !get(st, "revise", true)
                 get(st, "revise_disabled", false) ?
                     info("Revise disabled (--no-revise); source edits will not auto-apply") :
                     info("WARNING: Revise failed to load in this daemon — source edits will NOT auto-apply (see `jld logs`)")
             end
+            sf = get(st, "startup_failed", "")
+            isempty(sf) || info("WARNING: startup code failed (`$sf`) — daemon runs without it (see `jld logs`; rerun it via `jld eval`, or fix and `jld restart`)")
             return
         end
         if time() - lastmsg > 5
-            info("waiting for daemon to load... ($(round(Int, time() - t0))s)")
+            info(st isa Dict ? "running startup code... ($(round(Int, time() - t0))s)" :
+                               "waiting for daemon to load... ($(round(Int, time() - t0))s)")
             lastmsg = time()
         end
         sleep(0.2)
@@ -357,6 +406,13 @@ function ensure_running(ctx, flags)
     end
     st === :timeout && return
     get(flags, "no-autostart", false) && die("daemon not running (autostart disabled)", 3)
+    # Autostarting the default-environment daemon while others run is easy to
+    # do by accident (e.g. forgetting --id in a project-less checkout); say so.
+    if !haskey(flags, "id") && find_project(get(flags, "project", nothing)) === nothing
+        others = filter(id -> id != ctx.id && ping_alive(joinpath(cache_root(), id)), known_ids())
+        isempty(others) ||
+            info("no project here — autostarting a default-environment daemon; other running daemons: $(join(others, ", ")) (`--id` targets one)")
+    end
     cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
 end
 
@@ -570,12 +626,15 @@ function cmd_status(ctx)
         end
         return
     end
-    println("state:    ", st["busy"] ? "busy" : "idle")
+    println("state:    ", get(st, "booting", false) ? "starting (running --startup code)" :
+                          st["busy"] ? "busy" : "idle")
     if !get(st, "revise", true)
         get(st, "revise_disabled", false) ?
             println("revise:   disabled (--no-revise)") :
             println("revise:   NOT LOADED — source edits will not auto-apply (see `jld logs`)")
     end
+    sf = get(st, "startup_failed", "")
+    isempty(sf) || println("startup:  FAILED (`$sf`) — daemon runs without it (see `jld logs`)")
     st["busy"] && println("running:  `$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s")
     println("pid:      ", st["pid"])
     println("julia:    ", st["julia_version"])
@@ -603,7 +662,7 @@ function cmd_list(flags=Dict{String,Any}())
         cfg === nothing && continue
         st = try_ping(dir)
         session = (st isa Dict ? get(st, "kind", "") : get(cfg, "kind", "")) == "session"
-        state = st isa Dict ? (st["busy"] ? "busy" : "idle") :
+        state = st isa Dict ? (get(st, "booting", false) ? "starting" : st["busy"] ? "busy" : "idle") :
                 st === :timeout ? "unresponsive" : "dead"
         session && (state *= "/repl")
         dt = read_toml(joinpath(dir, "daemon.toml"))
@@ -750,12 +809,21 @@ function cmd_connect(ctx, flags)
 end
 
 function cmd_logs(ctx, flags)
-    isfile(log_path(ctx)) || die("no log file at $(log_path(ctx))")
+    path = log_path(ctx)
+    isfile(path) || die("no log file at $path")
     if get(flags, "follow", false)
-        run(`tail -n 40 -f $(log_path(ctx))`)
-    else
-        print(log_tail(ctx, 100))
+        run(`tail -n 40 -f $path`)
+        return
     end
+    lines = readlines(path)
+    n = length(lines)
+    if !get(flags, "all", false)
+        n = tryparse(Int, get(flags, "lines", "100"))
+        n === nothing && die("--lines must be an integer")
+        n < length(lines) &&
+            info("last $n of $(length(lines)) lines ($path); --lines=N or --all for the rest")
+    end
+    isempty(lines) || println(join(strip_ansi.(lines[max(1, end-n+1):end]), "\n"))
 end
 
 # Ask the daemon's control thread to profile the process for ~1s and report
@@ -838,9 +906,19 @@ function cmd_install()
     end
 end
 
-function cmd_setup(ctx)
+function cmd_setup(ctx, flags=Dict{String,Any}())
     ver, julia = probe_julia(ctx.julia, ctx.project)
-    ensure_env(julia, ver, force=true)
+    dev = get(flags, "dev", false)
+    envdir = ensure_env(julia, ver, force=!dev)
+    if dev
+        info("installing the Revise stack from master into @jld-v$(minor_of(ver)) (for unreleased julias)...")
+        code = "using Pkg; Pkg.add([PackageSpec(name=n, rev=\"master\") for n in (\"Revise\", \"JuliaInterpreter\", \"LoweredCodeUtils\")])"
+        env = default_julia_env()
+        env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
+        p = run(pipeline(ignorestatus(setenv(`$julia --startup-file=no --project=$envdir -e $code`, env)), stdout=stderr, stderr=stderr))
+        success(p) || die("master install failed (see errors above)")
+    end
+    ensure_revise_loads(julia, ctx.project, envdir, ver)
     info("daemon environment ready")
 end
 
@@ -868,8 +946,10 @@ commands:
                     in the daemon (jld eval/run and remote REPL), output truncated
                     per entry — lets an agent read the context of a running session
   stacks [id]       show task backtraces of what the daemon is currently executing
-  logs [-f]         show daemon log
-  setup             (re)install the daemon environment for the selected julia
+  logs [-f]         show daemon log (last 100 lines; --lines=N or --all for more)
+  setup             (re)install the daemon environment for the selected julia;
+                    --dev installs the Revise stack from master (for unreleased
+                    X.Y-DEV julias where the registry versions do not precompile)
   install           install the agent skill into ~/.agents/skills (cross-tool) and the
                     skills dirs of installed agents (~/.claude, ~/.codex);
                     plus a ~/.local/bin/jld symlink if jld is not on PATH
@@ -910,14 +990,14 @@ function parse_cli(args)
                 k, v = split(a[3:end], "=", limit=2)
                 if k == "startup"
                     push!(get!(Vector{String}, flags, "startup"), String(v))
-                elseif k in ("project", "name", "julia", "threads", "timeout", "module", "id")
+                elseif k in ("project", "name", "julia", "threads", "timeout", "module", "id", "lines")
                     flags[String(k)] = String(v)
                 else
                     die("unknown flag --$k")
                 end
             else
                 k = a[3:end]
-                k in ("no-autostart", "print", "follow", "help", "scratch", "no-revise", "revise") || die("unknown flag --$k")
+                k in ("no-autostart", "print", "follow", "help", "scratch", "no-revise", "revise", "all", "dev") || die("unknown flag --$k")
                 flags[k] = true
             end
         else
@@ -950,7 +1030,11 @@ function run_cli(args::Vector{String})
         cmd_install()
         return
     elseif cmd == "status"
-        cmd_status(resolve())
+        # Outside a project, report on the unique running daemon rather than
+        # declaring the (idle) default-environment identity "not running".
+        ctx = outside_project() ?
+            ctx_from_only_running(flags, c -> try_ping(c.dir) !== nothing) : resolve()
+        cmd_status(ctx)
         return
     elseif cmd == "connect"
         posid = length(pos) >= 2 ? pos[2] : nothing
@@ -998,7 +1082,7 @@ function run_cli(args::Vector{String})
     elseif cmd == "start"
         cmd_start(ctx, flags)
     elseif cmd == "setup"
-        cmd_setup(ctx)
+        cmd_setup(ctx, flags)
     else
         die("unknown command \"$cmd\" (see jld --help)")
     end

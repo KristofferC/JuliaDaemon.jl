@@ -1,6 +1,6 @@
 ---
 name: julia-daemon
-description: Run Julia code through jld (a persistent Revise-enabled daemon) instead of spawning fresh julia processes. Use whenever executing Julia code in a project — evaluating snippets, running scratch/test scripts, or testing package changes — to avoid paying package load and compile latency on every run.
+description: Run Julia code through jld (a persistent Revise-enabled daemon) instead of spawning fresh julia processes. Use whenever executing Julia code in a project — evaluating snippets, running scratch/test scripts, testing package changes, or working on Julia itself (Base/stdlib edits in a julia checkout) — to avoid paying package load and compile latency on every run.
 ---
 
 # julia-daemon (jld)
@@ -16,6 +16,11 @@ are applied automatically before each request. Warm requests cost ~0.2s.
   dependencies or the package under development.
 - The daemon autostarts on first use (that request pays the package load).
   The project is already active — never put `Pkg.activate(...)` in scripts.
+  With no Project.toml anywhere upwards, the daemon serves the default user
+  environment (like plain julia).
+- If `--startup` code fails at boot, the daemon stays up without it and
+  `jld start`/`jld status` say so — rerun the code via `jld eval`, or fix
+  and `jld restart`.
 - `Main` state persists between requests like a REPL (including `ans`).
   Prefer fresh variable names; `jld restart` for a clean slate.
 - Take `jld:`-prefixed warnings seriously: "Revise failed to apply changes"
@@ -43,6 +48,27 @@ Long-running commands: pass `--timeout=SECS` (exit 124 interrupts the eval but
 keeps the daemon and its compile state alive). Note struct-layout changes may
 be handled by Revise on Julia ≥1.12; on older Julia they need `jld restart`.
 
+## Working on Julia itself (Base/stdlib)
+
+In a julia checkout with an in-tree build, Base edits apply live — no `make`:
+
+    mkdir -p /tmp/jld-base && touch /tmp/jld-base/Project.toml
+    jld start --julia=/path/to/julia/usr/bin/julia \
+        --project=/tmp/jld-base --startup='Revise.track(Base)'   # prints the daemon id
+    jld --id=<id> eval 'Base.foo(...)'   # edits under base/ apply per request
+
+- The julia repo has no top-level Project.toml, so bare `jld` commands run
+  from the checkout target the *default user environment*, not this daemon —
+  pass `--id=<id>` (printed by start, shown by `jld list`) or the same
+  `--project` on every command, `eval` included.
+- Keep the scratch Project.toml empty — a populated environment's manifest
+  can pin different versions of Revise's own deps, which forces (and on a
+  -DEV julia can break) re-precompilation.
+- On unreleased julia versions (X.Y-DEV) the registry's Revise stack may not
+  precompile at all; `jld start` detects this and prints the fix:
+  `jld setup --dev --julia=... --project=...` installs the stack from
+  master into `@jld-vX.Y` (or start with `--no-revise`).
+
 ## Interrupting
 
 `jld interrupt` stops the current eval at the next yield point; the daemon
@@ -60,7 +86,9 @@ jld eval --scratch '<code>'  eval in a throwaway module that sees Main's binding
 jld run <file.jl>   include a file                              [autostarts]
 jld start           pre-warm; --startup='using MyPkg' runs at boot
 jld restart         reload from scratch (keeps recorded --startup)
-jld status | list | logs [-f] | stop | kill | interrupt | gc
+jld status | list | stop | kill | interrupt | gc
+jld logs [-f | --lines=N | --all]   daemon log (default: last 100 lines —
+                    a failed start's root cause may be further up: --all)
 jld stacks          task backtraces of what the daemon is executing right now
 jld transcript      full session history (all inputs + outputs, incl. the human's
                     REPL) — read this first when joining an existing session

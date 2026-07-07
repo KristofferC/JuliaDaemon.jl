@@ -84,7 +84,8 @@ Both take:
 
 - `jld start` — start the daemon ahead of time. `--startup='using MyPkg'`
   runs code at boot (repeat the flag for more) and is remembered, so a later
-  `restart` runs it again. `--threads=N` sets the number of eval threads;
+  `restart` runs it again; if it fails, the daemon stays up without it and
+  `start`/`status` warn. `--threads=N` sets the number of eval threads;
   one extra interactive thread is always added, which is what keeps `status`
   and `connect` responsive while an eval is hogging the CPU. `--timeout`
   caps how long to wait for the daemon to come up.
@@ -107,7 +108,8 @@ Both take:
   didn't load. Works even mid-eval.
 - `jld list` — every daemon, with a `*` on the one your current directory
   targets.
-- `jld logs [-f]` — the daemon's log. `-f` follows it.
+- `jld logs [-f]` — the daemon's log; the last 100 lines by default,
+  `--lines=N` or `--all` for more, `-f` follows it.
 - `jld transcript [id] [-f]` — everything that has been evaluated in the
   session, inputs and outputs, from `jld eval` and attached REPLs alike
   (long outputs are truncated). If you are joining a session someone else
@@ -181,10 +183,15 @@ otherwise.
 ## Julia versions
 
 `--julia=BIN` (or `JLD_JULIA`) decides which julia the daemon runs. An
-in-tree `usr/bin/julia` build works fine. The daemon's own dependency
-(Revise) installs on first use into a small named environment per minor
-version (`@jld-v1.12`, …), so the jld installation itself can live on a
-read-only path. And since the protocol is plain text, the CLI and
+in-tree `usr/bin/julia` build works fine — with
+`--startup='Revise.track(Base)'` even Base edits apply live. The daemon's
+own dependency (Revise) installs on first use into a small named environment
+per minor version (`@jld-v1.12`, …), so the jld installation itself can live
+on a read-only path. Before starting, jld checks that Revise actually loads
+with that julia and project; on an unreleased julia where the registry's
+Revise stack does not precompile, it tells you what to do instead of
+launching a doomed daemon (usually `jld setup --dev`, which installs the
+Revise stack from master). And since the protocol is plain text, the CLI and
 `jld connect` work across versions. When your dev build is broken
 mid-rebase, `status`, `logs` and `stop` still work.
 
