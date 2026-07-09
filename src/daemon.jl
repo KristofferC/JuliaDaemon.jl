@@ -26,7 +26,7 @@ end
 include("protocol.jl")
 include("repl_input.jl")
 
-# Bounded output capture for the transcript: full head, ring-buffered tail.
+# Bounded output capture (transcript, --max-output): full head, ring-buffered tail.
 const CAP_HEAD = 12 * 1024
 const CAP_TAIL = 4 * 1024
 
@@ -36,13 +36,15 @@ mutable struct Capture
     tstart::Int
     tcount::Int
     total::Int
+    headmax::Int
 end
-Capture() = Capture(UInt8[], zeros(UInt8, CAP_TAIL), 0, 0, 0)
+Capture(headmax=CAP_HEAD, tailmax=CAP_TAIL) = Capture(UInt8[], zeros(UInt8, tailmax), 0, 0, 0, headmax)
 
 function cap_write!(c::Capture, data::AbstractVector{UInt8})
+    tailmax = length(c.tail)
     c.total += length(data)
     i = 1
-    room = CAP_HEAD - length(c.head)
+    room = c.headmax - length(c.head)
     if room > 0
         n = min(room, length(data))
         append!(c.head, view(data, 1:n))
@@ -50,25 +52,28 @@ function cap_write!(c::Capture, data::AbstractVector{UInt8})
     end
     rem = length(data) - i + 1
     rem <= 0 && return
-    # Only the final CAP_TAIL bytes can survive in the ring; for a large write
+    # Only the final tailmax bytes can survive in the ring; for a large write
     # skip straight to them with one bulk copy instead of spinning per-byte.
-    if rem >= CAP_TAIL
-        copyto!(c.tail, 1, data, length(data) - CAP_TAIL + 1, CAP_TAIL)
+    if rem >= tailmax
+        copyto!(c.tail, 1, data, length(data) - tailmax + 1, tailmax)
         c.tstart = 0
-        c.tcount = CAP_TAIL
+        c.tcount = tailmax
         return
     end
     while i <= length(data)
-        c.tail[(c.tstart + c.tcount) % CAP_TAIL + 1] = data[i]
-        c.tcount == CAP_TAIL ? (c.tstart = (c.tstart + 1) % CAP_TAIL) : (c.tcount += 1)
+        c.tail[(c.tstart + c.tcount) % tailmax + 1] = data[i]
+        c.tcount == tailmax ? (c.tstart = (c.tstart + 1) % tailmax) : (c.tcount += 1)
         i += 1
     end
 end
 cap_write!(c::Capture, s::AbstractString) = cap_write!(c, Vector{UInt8}(codeunits(s)))
 
+cap_tail(c::Capture) = UInt8[c.tail[(c.tstart + k) % length(c.tail) + 1] for k in 0:c.tcount-1]
+cap_omitted(c::Capture) = c.total - length(c.head) - c.tcount
+
 function cap_string(c::Capture)
-    tailbytes = UInt8[c.tail[(c.tstart + k) % CAP_TAIL + 1] for k in 0:c.tcount-1]
-    omitted = c.total - length(c.head) - c.tcount
+    tailbytes = cap_tail(c)
+    omitted = cap_omitted(c)
     head = String(copy(c.head))
     omitted <= 0 && return head * String(tailbytes)
     string(head, "\n⋯ jld: ", omitted, " bytes of output omitted ⋯\n", String(tailbytes))
@@ -88,6 +93,7 @@ struct Request
     broken::Ref{Bool}
     sendlock::ReentrantLock
     cap::Capture
+    outcap::Union{Capture,Nothing}  # --max-output: nothing = stream everything
 end
 
 const CURRENT = Ref{Union{Request,Nothing}}(nothing)
@@ -101,6 +107,10 @@ const STARTUP_ERROR = Ref("")
 const EVAL_TASK = Ref{Task}()
 const STATE_DIR = Ref("")
 const NAME = Ref("")
+const CHECKOUT = Ref("")  # julia source checkout served by this daemon ("" if none)
+# --idle-timeout: stop after this many seconds without requests (0 = never).
+const IDLE_TTL = Ref(0.0)
+const LAST_ACTIVITY = Ref(time())
 
 # In-session introspection, e.g. `Main.JLDDaemon.id()` from an eval or the
 # attached REPL.
@@ -122,7 +132,8 @@ end
 
 # Soft interrupt: only lands when the eval task is at a
 # yield point. CPU-bound code that never yields cannot be interrupted this
-# way; `jld kill` is the fallback.
+# way; the client escalates (--timeout, `jld interrupt --force`) by killing
+# the daemon after a grace period.
 function interrupt_eval()
     CURRENT[] === nothing && return false
     try
@@ -132,6 +143,30 @@ function interrupt_eval()
         return false
     end
 end
+
+# `exit(n)` evaluated in a request must not take the daemon down: a hooked
+# Base.exit turns it into EvalExit, which run_request maps to the client's
+# exit code. Outside a request (daemon shutdown, a served session's own REPL)
+# it exits the process as usual.
+struct EvalExit <: Exception
+    code::Int
+end
+
+@static if isdefined(Base, :ScopedValues)
+    const IN_EVAL = Base.ScopedValues.ScopedValue(false)
+    with_in_eval(f) = Base.ScopedValues.with(f, IN_EVAL => true)
+else
+    const IN_EVAL = Ref(false)
+    function with_in_eval(f)
+        IN_EVAL[] = true
+        try f() finally IN_EVAL[] = false end
+    end
+end
+
+exit_hook(n::Integer) = IN_EVAL[] ? throw(EvalExit(Int(n))) : ccall(:jl_exit, Cvoid, (Int32,), n % Int32)
+install_exit_hook() = @eval Base exit(n::Integer) = $(exit_hook)(n)
+
+unwrap_exit(e) = e isa EvalExit ? e : e isa LoadError ? unwrap_exit(e.error) : nothing
 
 # Spawned daemons log to stderr (redirected to the log file by the client);
 # session servers open the log file themselves. Captured once so per-request
@@ -213,6 +248,8 @@ function main(args::Vector{String})
             push!(startup, a[length("--startup=")+1:end])
         elseif startswith(a, "--log=")
             logfile = a[length("--log=")+1:end]
+        elseif startswith(a, "--idle-timeout=")
+            IDLE_TTL[] = something(tryparse(Float64, a[length("--idle-timeout=")+1:end]), 0.0)
         end
     end
     isempty(dir) && error("missing --dir")
@@ -281,7 +318,23 @@ function main(args::Vector{String})
     # interactive thread, so ping/status/queueing/REPL stay responsive even
     # while an eval is compute-bound and never yields.
     EVAL_TASK[] = Threads.@spawn :default eval_loop(requests)
+    IDLE_TTL[] > 0 && @async idle_watcher(requests)
     wait(EVAL_TASK[])
+end
+
+# Stop a daemon nobody has used for --idle-timeout seconds: agent workflows
+# leak warm daemons otherwise. Runs on the interactive thread; never installed
+# for interactive sessions (serve_session does not parse the flag).
+function idle_watcher(requests)
+    while true
+        sleep(clamp(IDLE_TTL[] / 4, 0.5, 60))
+        CURRENT[] === nothing || continue
+        (isready(requests) || BOOTING[]) && continue
+        time() - LAST_ACTIVITY[] > IDLE_TTL[] || continue
+        logmsg("no requests for more than $(round(Int, IDLE_TTL[]))s, stopping (--idle-timeout)")
+        Sys.iswindows() || rm(daemon_sock(STATE_DIR[]), force=true)
+        exit(0)
+    end
 end
 
 # Everything shared between spawned daemons and in-session servers: socket,
@@ -296,6 +349,8 @@ function setup_server(dir)
         Dict{String,Any}()
     end
     NAME[] = string(get(cfg, "name", ""))
+    CHECKOUT[] = string(get(cfg, "checkout", ""))
+    install_exit_hook()
 
     server = listen_or_yield(daemon_sock(dir))
     server === nothing && return nothing
@@ -440,6 +495,7 @@ function state_toml()
         "revise_disabled" => REVISE_DISABLED,
         "booting" => BOOTING[],
         "startup_failed" => STARTUP_ERROR[],
+        "idle_timeout" => IDLE_TTL[],
     )
     if cur !== nothing
         d["current"] = first(cur.code, 120)
@@ -500,6 +556,7 @@ function handle_connection(conn, requests)
             write_frame(conn, "done", "status = \"ok\"\n")
             close(conn)
         elseif kind == "complete"
+            LAST_ACTIVITY[] = time()
             d = try
                 TOML.parse(payload)
             catch
@@ -514,11 +571,19 @@ function handle_connection(conn, requests)
             write_frame(conn, "completions", sprint(io -> TOML.print(io, reply)))
             close(conn)
         elseif kind == "req"
+            LAST_ACTIVITY[] = time()
             d = TOML.parse(payload)
+            mo = Int(get(d, "max_output", 0))
+            outcap = if mo > 0
+                tailmax = clamp(mo ÷ 4, 256, CAP_TAIL)
+                Capture(max(mo - tailmax, 256), tailmax)
+            else
+                nothing
+            end
             req = Request(d["kind"], d["code"], get(d, "cwd", ""),
                           get(d, "module", ""), get(d, "scratch", false),
                           string(get(d, "client", "")), get(d, "color", false),
-                          conn, Ref(false), Ref(false), Ref(false), ReentrantLock(), Capture())
+                          conn, Ref(false), Ref(false), Ref(false), ReentrantLock(), Capture(), outcap)
             cur = CURRENT[]
             if cur !== nothing
                 write_frame(conn, "warn",
@@ -550,7 +615,12 @@ function request_reader(req)
             if CURRENT[] === req
                 interrupt_eval() || safe_send(req, "warn", "eval not at a yield point; cannot interrupt now")
             else
+                # Queued, not running: cancel and answer now — the client may
+                # be enforcing --timeout and must not wait behind the queue
+                # (or worse, escalate to killing the daemon over it).
                 req.cancelled[] = true
+                req.done[] = true
+                safe_send(req, "done", "status = \"interrupted\"\n")
             end
         elseif kind == "eof"
             if !req.done[]
@@ -576,7 +646,7 @@ function eval_loop(requests)
             rethrow()
         end
         if req.cancelled[]
-            safe_send(req, "done", "status = \"interrupted\"\n")
+            req.done[] || safe_send(req, "done", "status = \"interrupted\"\n")
             req.done[] = true
             try close(req.sock) catch end
             continue
@@ -589,6 +659,7 @@ function eval_loop(requests)
             e isa InterruptException || logmsg("request failed internally: $(sprint(showerror, e, catch_backtrace()))")
         finally
             CURRENT[] = nothing
+            LAST_ACTIVITY[] = time()
             req.done[] = true
             try close(req.sock) catch end
         end
@@ -612,12 +683,41 @@ function pump(rd, kind, req)
             eof(rd) && return
             data = readavailable(rd)
             cap_write!(req.cap, data)
-            safe_send(req, kind, String(data))
+            if req.outcap === nothing
+                safe_send(req, kind, String(data))
+            else
+                stream_capped(req, kind, data)
+            end
         catch e
             e isa InterruptException && continue
             return
         end
     end
+end
+
+# --max-output: stream only what fits the head budget live; the rest goes
+# into the ring, and flush_capped delivers the tail (plus an omission marker
+# if the middle overflowed the ring) when the request finishes. cap_write!
+# fills the head from the front of `data`, so the streamed bytes are exactly
+# the head growth.
+function stream_capped(req, kind, data)
+    oc = req.outcap
+    before = length(oc.head)
+    cap_write!(oc, data)
+    n = length(oc.head) - before
+    n > 0 && safe_send(req, kind, String(data[1:n]))
+end
+
+# stdout and stderr share the budget, so the withheld tail is interleaved in
+# arrival order; it is delivered as stdout.
+function flush_capped(req)
+    oc = req.outcap
+    oc === nothing && return
+    oc.total > length(oc.head) || return
+    omitted = cap_omitted(oc)
+    tail = String(cap_tail(oc))
+    marker = omitted > 0 ? "\n⋯ jld: $omitted bytes of output omitted (--max-output) ⋯\n" : ""
+    safe_send(req, "out", marker * tail)
 end
 
 function run_request(req)
@@ -631,6 +731,7 @@ function run_request(req)
     pump_err = Threads.@spawn :interactive pump(rd_err, "err", req)
 
     status = "ok"
+    exitcode = 0
     resultstr = nothing
     evalmod = nothing
     try
@@ -650,11 +751,13 @@ function run_request(req)
         # invokelatest: these reflect over bindings created by earlier requests
         evalmod = req.scratch ? Base.invokelatest(scratch_module) :
                                 Base.invokelatest(eval_module, req.mod)::Module
-        result = withcwd(req.cwd) do
-            if req.kind == "include"
-                Base.include(REPL.softscope, evalmod, req.code)
-            else
-                include_string(REPL.softscope, evalmod, req.code, "jld-eval")
+        result = with_in_eval() do
+            withcwd(req.cwd) do
+                if req.kind == "include"
+                    Base.include(REPL.softscope, evalmod, req.code)
+                else
+                    include_string(REPL.softscope, evalmod, req.code, "jld-eval")
+                end
             end
         end
         evalmod === Main && setglobal!(Base.MainInclude, :ans, result)
@@ -664,11 +767,17 @@ function run_request(req)
         end
         result = nothing
     catch e
+        ee = unwrap_exit(e)
         if is_interrupt(e)
             status = "interrupted"
+        elseif ee !== nothing
+            status = "exit"
+            exitcode = ee.code
         else
             status = "error"
-            print(stderr, Base.invokelatest(format_error, e, catch_backtrace(), req.color)::String)
+            bt = catch_backtrace()
+            print(stderr, Base.invokelatest(format_error, e, bt, req.color)::String)
+            Base.invokelatest(save_full_error, e, bt)
         end
     finally
         try
@@ -685,11 +794,14 @@ function run_request(req)
 
     req.scratch && evalmod isa Module && Base.invokelatest(scrub_module, evalmod)
 
+    flush_capped(req)
     if resultstr !== nothing
         cap_write!(req.cap, endswith(resultstr, '\n') ? resultstr : resultstr * "\n")
         safe_send(req, "result", resultstr)
     end
-    safe_send(req, "done", "status = \"$status\"\nelapsed = $(round(time() - t0, digits=3))\n")
+    donepayload = "status = \"$status\"\nelapsed = $(round(time() - t0, digits=3))\n"
+    status == "exit" && (donepayload *= "exitcode = $exitcode\n")
+    safe_send(req, "done", donepayload)
     # Mark done before the client reacts to the done frame: it closes its end
     # immediately, and the request reader must not mistake that for a
     # disconnect-during-eval and fire an interrupt.
@@ -709,6 +821,7 @@ function run_request(req)
         input = req.code
     end
     isempty(req.mod) || (source *= " in Main.$(req.mod)")
+    status == "exit" && (status = "exit($exitcode)")
     transcript_entry(source, rstrip(input), cap_string(req.cap); status, elapsed=time() - t0)
     logmsg("request finished: $status ($(round(time() - t0, digits=2))s) `$(first(req.code, 80))`")
 end
@@ -792,7 +905,45 @@ function render(x, color::Bool=false)
     end
 end
 
-function format_error(e, bt, color::Bool=false)
+# Frames from Base/stdlib or installed packages, i.e. not code the user can
+# edit. In a checkout daemon the checkout (Base and stdlib included) IS the
+# user's code, so anything under it stays visible.
+function is_internal_frame(fr)
+    fr.from_c && return true
+    f = String(fr.file)
+    !isempty(CHECKOUT[]) && startswith(f, CHECKOUT[]) && return false
+    startswith(f, "./") && return true  # Base's build-relative source paths
+    startswith(f, Sys.STDLIB) && return true
+    any(d -> startswith(f, joinpath(d, "packages")), Base.DEPOT_PATH) && return true
+    false
+end
+
+# Collapse runs of internal frames: the innermost frame of a run names the
+# throw site and is kept; the frames above it are machinery between there and
+# the user's code, which `jld trace` can show in full.
+function collapse_stack(st)
+    kept = eltype(st)[]
+    hidden = 0
+    i = firstindex(st)
+    while i <= lastindex(st)
+        if !is_internal_frame(st[i])
+            push!(kept, st[i])
+            i += 1
+            continue
+        end
+        j = i
+        while j < lastindex(st) && is_internal_frame(st[j+1])
+            j += 1
+        end
+        push!(kept, st[i])
+        # Hiding one or two frames saves less than the marker line costs.
+        j - i >= 2 ? (hidden += j - i) : append!(kept, st[i+1:j])
+        i = j + 1
+    end
+    kept, hidden
+end
+
+function format_error(e, bt, color::Bool=false; collapse::Bool=true)
     st = Base.stacktrace(bt)
     n = findfirst(fr -> String(fr.file) == @__FILE__, st)
     n !== nothing && (st = st[1:n-1])
@@ -800,11 +951,28 @@ function format_error(e, bt, color::Bool=false)
     while !isempty(st) && (endswith(String(st[end].file), "loading.jl") || endswith(String(st[end].file), "Base_compiler.jl"))
         pop!(st)
     end
+    hidden = 0
+    collapse && ((st, hidden) = collapse_stack(st))
     sprint() do io
         ioc = IOContext(io, :limit => true, :color => color)
         print(ioc, "ERROR: ")
         showerror(ioc, e, st)
         println(ioc)
+        hidden > 0 && println(ioc, "⋯ $hidden internal frames hidden; `jld trace` shows the full backtrace ⋯")
+    end
+end
+
+# The uncollapsed backtrace of the last eval error, for `jld trace`. Evals are
+# serialized, so plain overwrite is safe.
+function save_full_error(e, bt)
+    isempty(STATE_DIR[]) && return
+    try
+        open(joinpath(STATE_DIR[], "lasterror.log"), "w") do io
+            println(io, "#= ", Libc.strftime("%Y-%m-%d %H:%M:%S", time()),
+                    " full backtrace of the last eval error =#")
+            write(io, format_error(e, bt, false; collapse=false))
+        end
+    catch
     end
 end
 

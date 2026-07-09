@@ -27,7 +27,7 @@ checkout() { # checkout <desc> <needle> <haystack>
 }
 
 cleanup() {
-    for n in $NAME iso; do
+    for n in $NAME iso idle; do
         "$JLD" --project="$WORK/ToyPkg" --name=$n kill >/dev/null 2>&1
     done
     [ -n "$SESSPID" ] && kill -9 $SESSPID >/dev/null 2>&1
@@ -69,6 +69,38 @@ check "error exit code" 1 $?
 out=$($J eval 'sqrt(-1)' 2>&1)
 checkout "backtrace shown" "DomainError" "$out"
 
+# ---- exit propagation ----
+
+$J eval 'exit(7)' >/dev/null 2>&1
+check "exit(N) propagates as exit code" 7 $?
+$J eval 'exit()' >/dev/null 2>&1
+check "exit() propagates 0" 0 $?
+out=$($J eval '"alive after exit"' 2>&8)
+checkout "daemon survives exit()" "alive after exit" "$out"
+
+# ---- collapsed backtraces + trace ----
+
+out=$($J eval 'sum(i -> i == 2 ? error("deep boom") : i, 1:3)' 2>&1)
+check "deep error exit code" 1 $?
+checkout "deep error message shown" "deep boom" "$out"
+checkout "internal frames collapsed" "internal frames hidden" "$out"
+out=$($J trace 2>&8)
+checkout "trace has the error" "deep boom" "$out"
+if [[ "$out" == *"internal frames hidden"* ]]; then
+    check "trace is uncollapsed" 0 1
+else
+    check "trace is uncollapsed" 0 0
+fi
+
+# ---- --max-output ----
+
+out=$($J --max-output=4k eval 'for i in 1:3000; println("cap ", i); end; "capped"' 2>&8)
+check "max-output eval succeeds" 0 $?
+checkout "max-output keeps the head" "cap 1
+cap 2" "$out"
+checkout "max-output keeps the tail" "cap 3000" "$out"
+checkout "max-output drops the middle" "bytes of output omitted (--max-output)" "$out"
+
 # Wait until the daemon reports busy (a background eval has landed).
 wait_busy() {
     for i in $(seq 1 80); do
@@ -107,6 +139,17 @@ $J eval 'Libc.systemsleep(10)' >/dev/null 2>&1 &
 if wait_busy; then busyres="busy"; else busyres="never busy"; fi
 checkout "status answers during CPU-bound eval" "busy" "$busyres"
 wait
+
+# ---- timeout while queued ----
+
+$J eval 'sleep(6); "blocker"' >/dev/null 2>&1 &
+BPID=$!
+wait_busy
+$J --timeout=1 eval '"queued victim"' >/dev/null 2>&1
+check "queued eval times out promptly" 124 $?
+wait $BPID
+out=$($J eval '"queue survivor"' 2>&8)
+checkout "daemon survived a queued timeout" "queue survivor" "$out"
 
 # ---- files, modules, scratch ----
 
@@ -209,10 +252,60 @@ checkout "session survived stop" "session alive" "$out"
 kill -9 $SESSPID >/dev/null 2>&1
 SESSPID=""
 
+# ---- timeout escalation (non-yielding eval) ----
+
+$J --timeout=2 eval 'Libc.systemsleep(600)' >/dev/null 2>"$WORK/esc.err" &
+EPID=$!
+for i in $(seq 1 60); do kill -0 $EPID 2>/dev/null || break; sleep 0.5; done
+if kill -0 $EPID 2>/dev/null; then
+    kill -9 $EPID
+    check "timeout escalation exits" 124 999
+else
+    wait $EPID
+    check "timeout escalation exits" 124 $?
+fi
+checkout "escalation killed the daemon" "killed the daemon" "$(cat "$WORK/esc.err")"
+out=$($J eval '"fresh daemon"' 2>&8)
+check "autostart after escalation" 0 $?
+checkout "fresh daemon answers" "fresh daemon" "$out"
+
+# ---- interrupt --force ----
+
+$J eval 'Libc.systemsleep(600)' >/dev/null 2>&1 &
+FPID=$!
+wait_busy
+$J interrupt --force >/dev/null 2>&8
+wait $FPID
+check "force-killed eval client notices" 3 $?
+out=$($J --no-autostart eval '"forced restart"' 2>&8)
+check "interrupt --force restarted the daemon" 0 $?
+checkout "restarted daemon answers" "forced restart" "$out"
+
+# ---- --idle-timeout ----
+
+$JLD --project="$WORK/ToyPkg" --name=idle --no-revise --idle-timeout=3 start >/dev/null 2>&8
+out=$($JLD --project="$WORK/ToyPkg" --name=idle eval '"idle up"' 2>&8)
+checkout "idle-timeout daemon works" "idle up" "$out"
+st=""
+for i in $(seq 1 45); do
+    st=$($JLD --project="$WORK/ToyPkg" --name=idle status 2>&8)
+    [[ "$st" == *"not running"* ]] && break
+    sleep 1
+done
+checkout "idle-timeout stops the daemon" "not running" "$st"
+
 # ---- gc / shutdown ----
 
 $JLD --project="$WORK/ToyPkg" --name=iso kill >/dev/null 2>&1
 sleep 0.5
+out=$($JLD --project="$WORK/ToyPkg" list 2>&8)
+if [[ "$out" == *"ToyPkg-iso"* ]]; then
+    check "list hides dead daemons" 0 1
+else
+    check "list hides dead daemons" 0 0
+fi
+out=$($JLD --project="$WORK/ToyPkg" list --all 2>&8)
+checkout "list --all shows dead daemons" "ToyPkg-iso" "$out"
 out=$($JLD --project="$WORK/ToyPkg" gc 2>&1)
 checkout "gc removes dead daemons" "removed" "$out"
 out=$($J eval '"still here"' 2>&8)

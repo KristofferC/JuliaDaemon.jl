@@ -28,10 +28,18 @@ are applied automatically before each request. Warm requests cost ~0.2s.
   means the output came from STALE code — fix the file and rerun, or
   `jld restart` if it persists.
 - Exit codes are honest: 0 ok, 1 julia error (backtrace on stderr),
-  2 usage error, 3 daemon unreachable, 124 timeout, 130 interrupted.
+  2 usage error, 3 daemon unreachable, 124 timeout, 130 interrupted; code
+  that calls `exit(N)` gives exit code N and the daemon survives it.
   Judge success by the exit code and the final `jld: daemon ready` line —
   not by `ERROR`/backtrace text scrolling past during a one-time setup, which
   may be an expected-and-healed step (e.g. reinstalling Revise from master).
+- Backtraces are shown with runs of internal frames (Base, stdlib, installed
+  packages) folded; the innermost frame — the throw site — is always kept.
+  When you need the machinery in between, `jld trace` prints the full
+  backtrace of the last error without rerunning anything.
+- For code that may print a lot, pass `--max-output=16k`: output beyond the
+  cap keeps its head and tail and drops the middle, so a runaway print loop
+  cannot flood your context.
 
 ## Joining a human's live session
 
@@ -48,8 +56,10 @@ it is the user's live REPL (`jld stop` is refused automatically).
 2. `jld run /path/to/scratch.jl`
 3. Edit package source, `jld run` again — the edit is live, no reload.
 
-Long-running commands: pass `--timeout=SECS` (exit 124 interrupts the eval but
-keeps the daemon and its compile state alive). Note struct-layout changes may
+Long-running commands: pass `--timeout=SECS`. It always terminates in bounded
+time with exit 124: the eval is interrupted (daemon and compile state
+survive), and only if it never yields is the daemon killed after a ~3s grace
+— the next call starts a fresh one. Note struct-layout changes may
 be handled by Revise on Julia ≥1.12; on older Julia they need `jld restart`.
 
 ## Working on Julia itself (Base/stdlib)
@@ -80,8 +90,11 @@ from inside it use the in-tree julia, a jld-managed scratch environment, and
 
 `jld interrupt` stops the current eval at the next yield point; the daemon
 survives. Pure CPU loops that never yield cannot be soft-interrupted: check
-`jld stacks` to see what it is doing, then `jld kill` if stuck — the next
-eval autostarts fresh.
+`jld stacks` to see what it is doing, then `jld interrupt --force` — it
+soft-interrupts first and only kills + restarts the daemon (pre-warmed, with
+its recorded options) if the eval does not yield within ~3s. Never use
+`--force` or `jld kill` on a session daemon (it is the user's live REPL;
+`--force` refuses them automatically, `kill` does not).
 
 ## Commands
 
@@ -91,9 +104,12 @@ jld eval --scratch '<code>'  eval in a throwaway module that sees Main's binding
                     and keeps NOTHING — prefer for exploration so Main stays
                     clean (also works with run: `jld run --scratch file.jl`)
 jld run <file.jl>   include a file                              [autostarts]
-jld start           pre-warm; --startup='using MyPkg' runs at boot
+jld start           pre-warm; --startup='using MyPkg' runs at boot;
+                    --idle-timeout=30m stops it after 30m without requests
 jld restart         reload from scratch (keeps recorded --startup)
-jld status | list | stop | kill | interrupt | gc
+jld status | list | stop | kill | interrupt [--force] | gc
+jld trace           full backtrace of the last eval error (errors print a
+                    collapsed one)
 jld logs [-f | --lines=N | --all]   daemon log (default: last 100 lines —
                     a failed start's root cause may be further up: --all)
 jld stacks          task backtraces of what the daemon is executing right now
@@ -110,6 +126,7 @@ one project — set this if another agent may share the directory),
 `--id=ID` (target any existing daemon from `jld list`, any command),
 `--module=M` (eval/run in module Main.M instead of Main),
 `--julia=BIN` / `JLD_JULIA` (daemon's julia, e.g. an in-tree build),
-`--timeout=SECS`,
+`--timeout=SECS`, `--max-output=N` (cap streamed output, e.g. `16k`),
+`--idle-timeout=T` (start/restart: self-stop after T idle, e.g. `30m`),
 `--no-revise` (daemon without Revise: faster start, but source edits need
 `jld restart`; recorded — pass `--revise` on restart to re-enable).

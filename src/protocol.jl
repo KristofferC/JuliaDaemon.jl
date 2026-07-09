@@ -3,7 +3,7 @@
 
 # Bumped when behavior changes enough that a daemon still running older code
 # should be restarted; the client warns on mismatch.
-const JLD_PROTO = 1
+const JLD_PROTO = 2
 
 # A stray writer on the socket must not make us allocate unboundedly from a
 # garbage length header.

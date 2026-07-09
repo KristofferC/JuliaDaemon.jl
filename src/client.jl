@@ -205,6 +205,20 @@ end
 
 minor_of(ver) = (m = match(r"^(\d+)\.(\d+)\.", ver); m === nothing ? die("cannot parse julia version \"$ver\"") : "$(m[1]).$(m[2])")
 
+# Durations for --idle-timeout: seconds, or m/h suffixed ("90", "30m", "2h").
+function parse_duration(s)
+    m = match(r"^(\d+(?:\.\d+)?)([smh]?)$", s)
+    m === nothing && die("cannot parse duration \"$s\" (seconds, or e.g. 30m, 2h)")
+    parse(Float64, m[1]) * (m[2] == "m" ? 60 : m[2] == "h" ? 3600 : 1)
+end
+
+# Sizes for --max-output: bytes, or k/m suffixed ("4096", "16k", "1m").
+function parse_bytes(s)
+    m = match(r"^(\d+)([kKmM]?)$", s)
+    m === nothing && die("cannot parse size \"$s\" (bytes, or e.g. 16k, 1m)")
+    parse(Int, m[1]) * (lowercase(m[2]) == "k" ? 1024 : lowercase(m[2]) == "m" ? 1024^2 : 1)
+end
+
 # Run a subprocess, capturing stdout+stderr together instead of streaming it.
 # Returns (success::Bool, output::String). Used for steps whose output is only
 # interesting when they fail (an expected-and-healed precompile failure on a
@@ -384,6 +398,7 @@ function cmd_start(ctx, flags)
     startup = get(flags, "startup", String[])
     threads = get(flags, "threads", nothing)
     norevise = get(flags, "no-revise", false) && !get(flags, "revise", false)
+    idle = haskey(flags, "idle-timeout") ? parse_duration(flags["idle-timeout"]) : 0.0
     norevise || ensure_revise_loads(julia, ctx.project, envdir, ver)
     cfg = Dict{String,Any}(
         "project" => ctx.project, "name" => ctx.name, "julia" => julia,
@@ -392,6 +407,7 @@ function cmd_start(ctx, flags)
     isempty(ctx.checkout) || (cfg["checkout"] = ctx.checkout)
     threads !== nothing && (cfg["threads"] = threads)
     norevise && (cfg["no_revise"] = true)
+    idle > 0 && (cfg["idle_timeout"] = idle)
     cfgtmp = joinpath(ctx.dir, ".config.toml.tmp")
     open(cfgtmp, "w") do io
         TOML.print(io, cfg)
@@ -414,6 +430,7 @@ function cmd_start(ctx, flags)
     push!(jargs, "--threads=$(something(threads, "1")),1")
     dargs = ["--dir=$(ctx.dir)"]
     append!(dargs, ["--startup=$s" for s in startup])
+    idle > 0 && push!(dargs, "--idle-timeout=$idle")
 
     Sys.iswindows() && push!(dargs, "--log=$(log_path(ctx))")
     cmd = `$julia $jargs $(joinpath(JLD_HOME, "src", "daemon_main.jl")) $dargs`
@@ -485,6 +502,8 @@ function apply_cfg(ctx, flags, cfg)
     cfg === nothing && return ctx
     haskey(flags, "startup") || (flags["startup"] = get(cfg, "startup", String[]))
     !haskey(flags, "threads") && haskey(cfg, "threads") && (flags["threads"] = cfg["threads"])
+    !haskey(flags, "idle-timeout") && haskey(cfg, "idle_timeout") &&
+        (flags["idle-timeout"] = string(cfg["idle_timeout"]))
     haskey(flags, "no-revise") || haskey(flags, "revise") ||
         (flags["no-revise"] = get(cfg, "no_revise", false))
     if !haskey(flags, "julia") && !haskey(ENV, "JLD_JULIA")
@@ -541,6 +560,7 @@ function cmd_exec(ctx, kind, arg, flags)
         req["module"] = m
     end
     get(flags, "scratch", false) && (req["scratch"] = true)
+    haskey(flags, "max-output") && (req["max_output"] = parse_bytes(flags["max-output"]))
     write_frame(conn, "req", sprint(io -> TOML.print(io, req)))
     exit(stream_response(ctx, conn, flags))
 end
@@ -554,23 +574,11 @@ function stream_response(ctx, conn, flags)
         end
     catch
     end
-    timedout = Ref(false)
-    timer = nothing
-    if haskey(flags, "timeout")
-        secs = parse(Float64, flags["timeout"])
-        timer = Timer(secs) do _
-            timedout[] = true
-            info("timeout after $(secs)s, interrupting daemon eval")
-            send_interrupt()
-        end
-    end
 
     status = Ref("error")
+    exitcode = Ref(1)
     lost = Ref(false)
     got_frame = Ref(false)
-    hint = Timer(5) do _
-        got_frame[] || info("no response from daemon yet; it may be busy in a non-yielding computation (`jld status`, `jld kill` if stuck)")
-    end
     reader = @async begin
         while true
             kind, payload = read_frame(conn)
@@ -584,13 +592,30 @@ function stream_response(ctx, conn, flags)
             elseif kind == "result"
                 println(stdout, payload); flush(stdout)
             elseif kind == "done"
-                status[] = get(TOML.parse(payload), "status", "error")
+                d = TOML.parse(payload)
+                status[] = get(d, "status", "error")
+                exitcode[] = Int(get(d, "exitcode", 1))
                 return
             elseif kind == "eof"
                 lost[] = true
                 return
             end # other kinds (e.g. "ack") just mark liveness
         end
+    end
+
+    timedout = Ref(false)
+    timer = nothing
+    if haskey(flags, "timeout")
+        secs = parse(Float64, flags["timeout"])
+        timer = Timer(secs) do _
+            timedout[] = true
+            info("timeout after $(secs)s, interrupting daemon eval")
+            send_interrupt()
+            @async escalate_timeout(ctx, reader, send_interrupt)
+        end
+    end
+    hint = Timer(5) do _
+        got_frame[] || info("no response from daemon yet; it may be busy in a non-yielding computation (`jld status`, `jld interrupt --force` if stuck)")
     end
 
     interrupts = 0
@@ -615,13 +640,43 @@ function stream_response(ctx, conn, flags)
     close(hint)
     close(conn)
 
+    # A timed-out request counts as 124 whether the interrupt landed or the
+    # daemon had to be killed (escalate_timeout, surfacing here as a lost
+    # connection).
+    timedout[] && (lost[] || status[] == "interrupted") && return 124
     if lost[]
         info("connection to daemon lost (crashed?); see `jld logs`")
         return 3
     end
     status[] == "ok" && return 0
-    status[] == "interrupted" && return timedout[] ? 124 : 130
+    status[] == "interrupted" && return 130
+    status[] == "exit" && return exitcode[]
     return 1
+end
+
+# A soft interrupt cannot stop an eval that never yields, and without
+# escalation a --timeout'd client would wait forever. Keep interrupting for a
+# grace period, then kill the daemon (never an interactive session) — the
+# next call autostarts a fresh one.
+const ESCALATE_GRACE = 3.0
+
+function escalate_timeout(ctx, reader, send_interrupt)
+    t0 = time()
+    while !istaskdone(reader) && time() - t0 < ESCALATE_GRACE
+        sleep(0.25)
+        send_interrupt()
+    end
+    istaskdone(reader) && return
+    if get(something(daemon_toml(ctx), Dict{String,Any}()), "kind", "") == "session"
+        info("eval did not yield within $(ESCALATE_GRACE)s and the daemon is an interactive session; not killing it — the eval keeps running there")
+        exit(124)
+    end
+    pid = daemon_pid(ctx)
+    if pid !== nothing && pid_alive(pid)
+        uv_kill(pid, SIGKILL_)
+        info("eval did not yield within $(ESCALATE_GRACE)s; killed the daemon (pid $pid) — the next call starts a fresh one")
+    end
+    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
 end
 
 function cmd_stop(ctx)
@@ -693,20 +748,58 @@ function cmd_restart(ctx, flags)
     cmd_start(apply_cfg(ctx, flags, cfg), flags)
 end
 
-function cmd_interrupt(ctx)
-    conn = try
-        connect(live_sock(ctx.dir))
+# One-shot interrupt request; false when it could not be delivered or the
+# eval was not at a schedulable point.
+function send_interrupt_frame(ctx)
+    try
+        conn = connect(live_sock(ctx.dir))
+        write_frame(conn, "interrupt")
+        kind, payload = read_frame(conn)
+        close(conn)
+        kind == "done" && contains(payload, "ok")
     catch
-        die("daemon not running", 3)
+        false
     end
-    write_frame(conn, "interrupt")
-    kind, payload = read_frame(conn)
-    close(conn)
-    if kind == "done" && contains(payload, "ok")
-        info("interrupt requested; it lands at the eval's next yield point (CPU-bound code may run to completion first — `jld kill` if stuck)")
-    else
+end
+
+function cmd_interrupt(ctx, flags=Dict{String,Any}())
+    force = get(flags, "force", false)
+    force && get(something(daemon_toml(ctx), Dict{String,Any}()), "kind", "") == "session" &&
+        die("this daemon is an interactive session; not killing it (plain `jld interrupt` soft-interrupts)", 3)
+    st = try_ping(ctx.dir)
+    st === nothing && die("daemon not running", 3)
+    # Whether anything is running comes from the ping: the interrupt reply
+    # says "noop" both for an idle daemon and for an eval that cannot be
+    # interrupted right now (CPU-bound, not at a yield point).
+    busy = st isa Dict ? st["busy"] : true
+    if !busy
         info("nothing to interrupt (daemon idle)")
+        return
     end
+    ok = send_interrupt_frame(ctx)
+    if !force
+        ok ? info("interrupt requested; it lands at the eval's next yield point (CPU-bound code may run to completion first — `jld interrupt --force` kills and restarts if it never yields)") :
+             info("could not interrupt (eval not at a yield point); `jld interrupt --force` kills and restarts the daemon")
+        return
+    end
+    # --force: give the soft interrupt a grace period, then kill and restart
+    # with the recorded options so the daemon comes back pre-warmed.
+    t0 = time()
+    while time() - t0 < ESCALATE_GRACE
+        sleep(0.25)
+        st = try_ping(ctx.dir)
+        if st isa Dict && !st["busy"]
+            info("interrupt landed; daemon is idle again")
+            return
+        end
+        (st isa Dict || st === :timeout) || break  # daemon died on its own
+        send_interrupt_frame(ctx)
+    end
+    pid = daemon_pid(ctx)
+    pid !== nothing && pid_alive(pid) && uv_kill(pid, SIGKILL_)
+    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
+    info("eval did not yield within $(ESCALATE_GRACE)s; killed the daemon (pid $(something(pid, "?"))), restarting it")
+    cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
 end
 
 function cmd_status(ctx)
@@ -741,6 +834,8 @@ function cmd_status(ctx)
     println("pid:      ", st["pid"])
     println("julia:    ", st["julia_version"])
     println("uptime:   ", round(st["uptime"] / 60, digits=1), " min")
+    it = get(st, "idle_timeout", 0.0)
+    it isa Real && it > 0 && println("idle:     stops after $(round(Int, it))s without requests (--idle-timeout)")
     if dt !== nothing
         println("REPL:     jld connect")
     end
@@ -750,15 +845,18 @@ end
 
 function cmd_list(flags=Dict{String,Any}())
     root = cache_root()
-    entries = isdir(root) ? sort(readdir(root)) : String[]
     # The daemon this context would target (what `jld eval` here acts upon).
     target = try
         make_ctx(flags).id
     catch
         nothing
     end
+    showall = get(flags, "all", false)
     rows = Vector{NTuple{6,String}}()
-    for id in known_ids()
+    hidden = String[]
+    # Row numbers are positions in known_ids() (what --id=N resolves against),
+    # so they must not shift when dead daemons are hidden.
+    for (n, id) in enumerate(known_ids())
         dir = joinpath(root, id)
         cfg = read_toml(joinpath(dir, "config.toml"))
         cfg === nothing && continue
@@ -767,21 +865,35 @@ function cmd_list(flags=Dict{String,Any}())
         state = st isa Dict ? (get(st, "booting", false) ? "starting" : st["busy"] ? "busy" : "idle") :
                 st === :timeout ? "unresponsive" : "dead"
         session && (state *= "/repl")
+        # Dead daemons clutter the list; keep them out of it (but never hide
+        # what this context targets), summarized below.
+        if !showall && startswith(state, "dead") && id != target
+            push!(hidden, id)
+            continue
+        end
         dt = read_toml(joinpath(dir, "daemon.toml"))
         pid = st isa Dict ? string(st["pid"]) :
               st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
         jver = dt !== nothing ? string(get(dt, "julia_version", "-")) : "-"
         proj = haskey(cfg, "checkout") ? string(cfg["checkout"], " (checkout)") : get(cfg, "project", "?")
-        push!(rows, (string(length(rows) + 1), id, state, pid, jver, proj))
+        push!(rows, (string(n), id, state, pid, jver, proj))
     end
-    isempty(rows) && (println("no daemons"); return)
+    if isempty(rows)
+        isempty(hidden) ? println("no daemons") :
+            println("no running daemons ($(length(hidden)) dead not shown; `jld list --all`)")
+        return
+    end
     header = ("#", "ID", "STATE", "PID", "JULIA", "PROJECT")
     widths = [maximum(length.([header[i], (r[i] for r in rows)...])) for i in 1:5]
     printrow(r; mark="  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:5], "  "), "  ", r[6])
     printrow(header)
     foreach(r -> printrow(r; mark=(r[2] == target ? "* " : "  ")), rows)
-    ndead = count(r -> r[3] == "dead", rows)
-    ndead > 0 && info("$ndead dead; `jld gc` removes their state (config, log, transcript)")
+    ndead = count(r -> startswith(r[3], "dead"), rows)
+    if !isempty(hidden)
+        info("not shown (dead): $(join(hidden, ", ")) — `jld list --all` lists them, `jld gc` removes their state")
+    elseif ndead > 0
+        info("$ndead dead; `jld gc` removes their state (config, log, transcript)")
+    end
 end
 
 known_ids() = (root = cache_root(); isdir(root) ?
@@ -958,6 +1070,14 @@ function cmd_stacks(ctx)
     got || info("daemon returned no stacks (predates this feature? `jld restart`)")
 end
 
+# Errors shown by eval/run collapse runs of internal frames; the daemon saves
+# the uncollapsed backtrace of the last one for this command.
+function cmd_trace(ctx)
+    path = joinpath(ctx.dir, "lasterror.log")
+    isfile(path) || die("no error recorded for $(ctx.id); the full backtrace of the last eval error lands here", 3)
+    write(stdout, read(path))
+end
+
 function cmd_transcript(ctx, flags)
     path = joinpath(ctx.dir, "transcript.log")
     isfile(path) || die("no transcript for $(ctx.id) yet", 3)
@@ -1033,10 +1153,15 @@ commands:
   start             start the daemon (pre-warm); --startup='using Foo' to run code at boot
   restart           restart (needed after struct redefinitions); keeps recorded --startup
   stop | kill       stop gracefully | SIGKILL
-  interrupt         interrupt the current eval at its next yield point; daemon survives
+  interrupt         interrupt the current eval at its next yield point; daemon
+                    survives. --force kills + restarts it if the eval does not
+                    yield within 3s (never done to interactive sessions)
   status            state of the daemon this context targets (see `list` for all)
-  list              list all daemons; * marks the one this context targets
+  list              list daemons; * marks the one this context targets; dead
+                    ones are summarized unless --all
   gc                remove the state (config, log, transcript) of dead daemons
+  trace [id]        full backtrace of the last eval error (evals print a
+                    collapsed one: runs of Base/package frames are folded)
   connect [id]      attach an interactive REPL to this project's daemon,
                     or to any daemon by id/prefix (see `jld list`); outside a project
                     with no id, connects to the single running daemon
@@ -1068,12 +1193,19 @@ flags:
   --startup=CODE    code to run at daemon boot (repeatable; with start/restart)
   --threads=N       daemon eval threads (default 1; +1 interactive thread is always
                     added so status/queueing/REPL work during CPU-bound evals)
-  --timeout=SECS    eval/run: interrupt after SECS (exit 124); start: wait limit
+  --timeout=SECS    eval/run: interrupt after SECS, exit 124 (an eval that then
+                    does not yield within 3s gets the daemon killed; the next
+                    call starts fresh); start: wait limit
+  --max-output=N    eval/run: cap streamed output at ~N bytes (16k, 1m, ...);
+                    head and tail are kept, the middle is dropped
+  --idle-timeout=T  start/restart: stop the daemon after T without requests
+                    (seconds, or 30m, 2h); recorded like --startup, 0 clears it
   --no-autostart    fail instead of autostarting (eval/run)
   --no-revise       start the daemon without Revise (source edits need `jld restart`);
                     recorded like --startup — pass --revise to re-enable on restart
 
-exit codes: 0 ok, 1 julia error, 2 usage, 3 daemon unavailable, 124 timeout, 130 interrupted
+exit codes: 0 ok, 1 julia error, 2 usage, 3 daemon unavailable, 124 timeout,
+130 interrupted; `exit(N)` in evaluated code exits N (the daemon survives)
 
 The daemon evaluates into Main with REPL soft-scope semantics and calls
 Revise.revise() before every request, so source edits under the project apply
@@ -1095,14 +1227,15 @@ function parse_cli(args)
                 k, v = split(a[3:end], "=", limit=2)
                 if k == "startup"
                     push!(get!(Vector{String}, flags, "startup"), String(v))
-                elseif k in ("project", "name", "julia", "threads", "timeout", "module", "id", "lines")
+                elseif k in ("project", "name", "julia", "threads", "timeout", "module", "id", "lines",
+                             "idle-timeout", "max-output")
                     flags[String(k)] = String(v)
                 else
                     die("unknown flag --$k")
                 end
             else
                 k = a[3:end]
-                k in ("no-autostart", "print", "follow", "help", "scratch", "no-revise", "revise", "all", "dev") || die("unknown flag --$k")
+                k in ("no-autostart", "print", "follow", "help", "scratch", "no-revise", "revise", "all", "dev", "force") || die("unknown flag --$k")
                 flags[k] = true
             end
         else
@@ -1152,18 +1285,20 @@ function run_cli(args::Vector{String})
         ctx = byid ? ctx_from_id(flags["id"]) : ctx_for_eval_repl(flags)
         cmd_eval_repl(ctx, length(pos) >= 2 ? pos[2] : nothing)
         return
-    elseif cmd == "transcript" || cmd == "stacks" || cmd == "logs"
+    elseif cmd == "transcript" || cmd == "stacks" || cmd == "logs" || cmd == "trace"
         posid = length(pos) >= 2 ? pos[2] : nothing
         ctx = if posid === nothing && outside_project()
             exists = cmd == "transcript" ? (c -> isfile(joinpath(c.dir, "transcript.log"))) :
                      cmd == "logs" ? (c -> isfile(log_path(c))) :
+                     cmd == "trace" ? (c -> isfile(joinpath(c.dir, "lasterror.log"))) :
                      (c -> try_ping(c.dir) !== nothing)
             ctx_from_only_running(flags, exists)
         else
             resolve(posid)
         end
         cmd == "transcript" ? cmd_transcript(ctx, flags) :
-        cmd == "logs" ? cmd_logs(ctx, flags) : cmd_stacks(ctx)
+        cmd == "logs" ? cmd_logs(ctx, flags) :
+        cmd == "trace" ? cmd_trace(ctx) : cmd_stacks(ctx)
         return
     elseif cmd in ("stop", "interrupt", "kill", "restart")
         # Outside a project, act on the unique running daemon when the
@@ -1176,7 +1311,7 @@ function run_cli(args::Vector{String})
             resolve()
         end
         cmd == "stop" ? cmd_stop(ctx) :
-        cmd == "interrupt" ? cmd_interrupt(ctx) :
+        cmd == "interrupt" ? cmd_interrupt(ctx, flags) :
         cmd == "kill" ? cmd_kill(ctx) : cmd_restart(ctx, flags)
         return
     end

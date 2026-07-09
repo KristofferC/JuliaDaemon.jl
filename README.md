@@ -51,8 +51,15 @@ can talk to any daemon julia, and tab completion keeps working even while
 the daemon is busy computing.
 
 Interrupts are soft: the eval task gets an `InterruptException` at its next
-yield point. A hot loop that never yields cannot be stopped that way.
-`jld kill` it and let the next eval start a fresh daemon.
+yield point. A hot loop that never yields cannot be stopped that way, so both
+`--timeout` and `jld interrupt --force` escalate: they keep interrupting for a
+few seconds and then kill the daemon (never an interactive session) — a
+runaway eval always terminates, at the cost of the warm state.
+
+Errors print with runs of Base/stdlib/package frames folded away, keeping the
+frames you can act on; `jld trace` retrieves the last error's full backtrace.
+And `exit(n)` inside an eval does not take the daemon down: the client exits
+with `n`, the daemon keeps running.
 
 ## Commands
 
@@ -74,7 +81,13 @@ Both take:
 - `--module=M` — run inside `Main.M`, created if needed. Can't be combined
   with `--scratch`.
 - `--timeout=SECS` — give up after SECS. The eval is interrupted, you get
-  exit code 124, and the daemon keeps its compile state.
+  exit code 124, and the daemon keeps its compile state. If the eval never
+  yields, the daemon is killed after a few seconds of grace instead (still
+  exit 124); the next call starts a fresh one.
+- `--max-output=N` — cap streamed output at roughly N bytes (`16k`, `1m`, …).
+  The head and tail are kept and the middle is dropped with a marker, so a
+  runaway `println` loop cannot flood the caller. Output that fits in
+  head+tail is delivered in full.
 - `--no-autostart` — normally `eval` and `run` start a daemon when none is
   running, and that first call sits through the whole package load. With
   this flag they fail fast instead (exit 3), for callers that only want an
@@ -92,7 +105,9 @@ Both take:
 - `jld restart` — stop and start again with the remembered options. This is
   what you want after redefining a struct on julia < 1.12.
 - `jld interrupt` — interrupt the current eval at its next yield point. The
-  daemon stays up.
+  daemon stays up. With `--force`, an eval that does not yield within a few
+  seconds gets the daemon killed and restarted with its remembered options
+  (never done to interactive sessions).
 - `jld stop` — shut down cleanly. Refused if the target is somebody's
   interactive session (see below).
 - `jld kill` — SIGKILL, no questions asked. Unlike `stop` this is not
@@ -101,13 +116,24 @@ Both take:
 - `jld gc` — clean up config, logs and transcripts left behind by dead
   daemons.
 
+`jld start --idle-timeout=30m` (or `2h`, or seconds) makes the daemon stop
+itself after that long without requests — useful when agents start daemons
+that nobody remembers to stop. Remembered like `--startup`;
+`--idle-timeout=0` on a restart clears it.
+
 ### Looking around
 
 - `jld status` — what the daemon is up to: busy or idle, what it is running
   and for how long, pid, julia version, uptime, and a warning if Revise
   didn't load. Works even mid-eval.
-- `jld list` — every daemon, with a `*` on the one your current directory
-  targets.
+- `jld list` — the daemons, with a `*` on the one your current directory
+  targets. Dead ones are summarized on one line instead of listed;
+  `--all` shows them as rows.
+- `jld trace [id]` — the full backtrace of the last eval error. Errors shown
+  by `eval`/`run` fold runs of internal frames (Base, stdlib, installed
+  packages) down to their innermost frame, which names the throw site; this
+  command has the whole thing when you need it. In a julia checkout, frames
+  under the checkout always stay visible.
 - `jld logs [-f]` — the daemon's log; the last 100 lines by default,
   `--lines=N` or `--all` for more, `-f` follows it.
 - `jld transcript [id] [-f]` — everything that has been evaluated in the
@@ -136,7 +162,8 @@ Both take:
 ### Exit codes
 
 0 the code ran, 1 it threw (backtrace on stderr), 2 you called `jld` wrong,
-3 the daemon can't be reached, 124 timed out, 130 interrupted.
+3 the daemon can't be reached, 124 timed out, 130 interrupted. Code that
+calls `exit(n)` gives you `n` — the daemon survives it.
 
 ## Flags
 
@@ -152,8 +179,12 @@ These work with every command; the eval-specific ones are listed above.
 - `--julia=BIN` (env `JLD_JULIA`) — which julia the daemon runs.
 - `--startup=CODE` — code to run at boot; may be repeated.
 - `--threads=N` — eval threads (default 1, plus the interactive thread).
-- `--timeout=SECS` — for eval/run, interrupt after SECS; for start, how long
-  to wait.
+- `--timeout=SECS` — for eval/run, interrupt after SECS (killing the daemon
+  if the eval never yields); for start, how long to wait.
+- `--idle-timeout=T` — for start/restart, stop the daemon after T without
+  requests (seconds, or `30m`, `2h`); remembered, `0` clears it.
+- `--max-output=N` — for eval/run, cap streamed output at ~N bytes
+  (`16k`, `1m`, …), keeping head and tail.
 - `--no-revise` — run the daemon without Revise. Source edits then need a
   `jld restart` to be picked up, and `status` will say so. The choice is
   remembered like `--startup`; pass `--revise` to a later restart to switch
