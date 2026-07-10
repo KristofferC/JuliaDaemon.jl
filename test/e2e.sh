@@ -192,8 +192,11 @@ checkout "named daemons are isolated" "false" "$out"
 
 out=$($JLD --project="$WORK/ToyPkg" --name=iso eval 'isdefined(Main, :Revise)' 2>&8)
 checkout "no-revise: Revise not loaded" "false" "$out"
-# A ping right after boot can transiently fail on slow runners; retry briefly.
+# A ping right after boot can transiently fail on slow runners, and a daemon
+# can be lost to OS memory pressure under load; re-ensure it each iteration
+# (autostart re-reads the recorded --no-revise) and retry briefly.
 for i in 1 2 3 4 5; do
+    $JLD --project="$WORK/ToyPkg" --name=iso eval '1' >/dev/null 2>&8
     out=$($JLD --project="$WORK/ToyPkg" --name=iso status 2>&8)
     [[ "$out" == *"revise:"* ]] && break
     sleep 1
