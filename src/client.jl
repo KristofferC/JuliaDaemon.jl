@@ -330,11 +330,28 @@ end
 function try_ping(dir; timeout=5.0)
     sock = live_sock(dir)
     dbg("ping: connecting to $sock")
-    conn = try
-        connect(sock)
-    catch
-        dbg("ping: no listener")
-        return nothing
+    # The connect itself is bounded: against a daemon wedged in a non-yielding
+    # eval the OS can queue the connection and connect() blocks indefinitely.
+    # Immediate connect failures get one retry — loaded runners produce
+    # transient failures against a perfectly live daemon.
+    conn = nothing
+    for attempt in 1:2
+        c = @async connect(sock)
+        if timedwait(() -> istaskdone(c), timeout; pollint=0.05) !== :ok
+            dbg("ping: connect timed out")
+            return :timeout
+        end
+        conn = try
+            fetch(c)
+        catch
+            if attempt == 2
+                dbg("ping: no listener")
+                return nothing
+            end
+            sleep(0.2)
+            continue
+        end
+        break
     end
     dbg("ping: connected")
     try
@@ -754,8 +771,10 @@ end
 # the listen backlog), and the --force path must reach its SIGKILL instead of
 # waiting the eval out.
 function send_interrupt_frame(ctx; timeout=2.0)
+    c = @async connect(live_sock(ctx.dir))
+    timedwait(() -> istaskdone(c), timeout; pollint=0.05) === :ok || return false
     conn = try
-        connect(live_sock(ctx.dir))
+        fetch(c)
     catch
         return false
     end
@@ -777,7 +796,13 @@ function cmd_interrupt(ctx, flags=Dict{String,Any}())
     force && get(something(daemon_toml(ctx), Dict{String,Any}()), "kind", "") == "session" &&
         die("this daemon is an interactive session; not killing it (plain `jld interrupt` soft-interrupts)", 3)
     st = try_ping(ctx.dir)
-    st === nothing && die("daemon not running", 3)
+    if st === nothing
+        # A wedged daemon (e.g. GC waiting on an eval stuck in a ccall) can
+        # fail the ping handshake outright; with a live pid on record, treat
+        # it like an unanswered ping instead of concluding it is gone.
+        pid = daemon_pid(ctx)
+        (pid !== nothing && pid_alive(pid)) || die("daemon not running", 3)
+    end
     # Whether anything is running comes from the ping: the interrupt reply
     # says "noop" both for an idle daemon and for an eval that cannot be
     # interrupted right now (CPU-bound, not at a yield point).
