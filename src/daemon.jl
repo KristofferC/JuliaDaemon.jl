@@ -111,6 +111,10 @@ const CHECKOUT = Ref("")  # julia source checkout served by this daemon ("" if n
 # --idle-timeout: stop after this many seconds without requests (0 = never).
 const IDLE_TTL = Ref(0.0)
 const LAST_ACTIVITY = Ref(time())
+# Whether any request has been served yet: until then the idle watcher applies
+# a floor on the TTL, so a short --idle-timeout cannot stop the daemon in the
+# boot-to-first-connection window on a slow machine.
+const SEEN_REQUEST = Ref(false)
 
 # In-session introspection, e.g. `Main.JLDDaemon.id()` from an eval or the
 # attached REPL.
@@ -330,7 +334,8 @@ function idle_watcher(requests)
         sleep(clamp(IDLE_TTL[] / 4, 0.5, 60))
         CURRENT[] === nothing || continue
         (isready(requests) || BOOTING[]) && continue
-        time() - LAST_ACTIVITY[] > IDLE_TTL[] || continue
+        ttl = SEEN_REQUEST[] ? IDLE_TTL[] : max(IDLE_TTL[], 30.0)
+        time() - LAST_ACTIVITY[] > ttl || continue
         logmsg("no requests for more than $(round(Int, IDLE_TTL[]))s, stopping (--idle-timeout)")
         Sys.iswindows() || rm(daemon_sock(STATE_DIR[]), force=true)
         exit(0)
@@ -557,6 +562,7 @@ function handle_connection(conn, requests)
             close(conn)
         elseif kind == "complete"
             LAST_ACTIVITY[] = time()
+            SEEN_REQUEST[] = true
             d = try
                 TOML.parse(payload)
             catch
@@ -572,6 +578,7 @@ function handle_connection(conn, requests)
             close(conn)
         elseif kind == "req"
             LAST_ACTIVITY[] = time()
+            SEEN_REQUEST[] = true
             d = TOML.parse(payload)
             mo = Int(get(d, "max_output", 0))
             outcap = if mo > 0
@@ -660,6 +667,7 @@ function eval_loop(requests)
         finally
             CURRENT[] = nothing
             LAST_ACTIVITY[] = time()
+            SEEN_REQUEST[] = true
             req.done[] = true
             try close(req.sock) catch end
         end
@@ -912,7 +920,9 @@ function is_internal_frame(fr)
     fr.from_c && return true
     f = String(fr.file)
     !isempty(CHECKOUT[]) && startswith(f, CHECKOUT[]) && return false
-    startswith(f, "./") && return true  # Base's build-relative source paths
+    # Base's build-relative source paths: "./abstractarray.jl" on 1.12 unix,
+    # ".\abstractarray.jl" on windows, bare "abstractarray.jl" on nightly.
+    isabspath(f) || return true
     startswith(f, Sys.STDLIB) && return true
     any(d -> startswith(f, joinpath(d, "packages")), Base.DEPOT_PATH) && return true
     false

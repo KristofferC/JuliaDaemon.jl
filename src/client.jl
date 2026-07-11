@@ -749,16 +749,26 @@ function cmd_restart(ctx, flags)
 end
 
 # One-shot interrupt request; false when it could not be delivered or the
-# eval was not at a schedulable point.
-function send_interrupt_frame(ctx)
+# eval was not at a schedulable point. The reply read is bounded: a daemon
+# wedged in a non-yielding eval may never answer (connect still succeeds via
+# the listen backlog), and the --force path must reach its SIGKILL instead of
+# waiting the eval out.
+function send_interrupt_frame(ctx; timeout=2.0)
+    conn = try
+        connect(live_sock(ctx.dir))
+    catch
+        return false
+    end
     try
-        conn = connect(live_sock(ctx.dir))
         write_frame(conn, "interrupt")
-        kind, payload = read_frame(conn)
-        close(conn)
+        t = @async read_frame(conn)
+        timedwait(() -> istaskdone(t), timeout; pollint=0.05) === :ok || return false
+        kind, payload = fetch(t)
         kind == "done" && contains(payload, "ok")
     catch
         false
+    finally
+        close(conn)
     end
 end
 
