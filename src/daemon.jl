@@ -178,7 +178,7 @@ unwrap_exit(e) = e isa EvalExit ? e : e isa LoadError ? unwrap_exit(e.error) : n
 const LOG_IO = Ref{IO}(stderr)
 const SESSION = Ref(false)
 
-logmsg(msg) = (println(LOG_IO[], "[jld ", Libc.strftime("%H:%M:%S", time()), "] ", msg); flush(LOG_IO[]))
+logmsg(msg) = (println(LOG_IO[], "[jld ", Libc.strftime("%Y-%m-%d %H:%M:%S", time()), "] ", msg); flush(LOG_IO[]))
 
 # ---- session transcript (input + output of everything evaluated in Main) ----
 
@@ -501,6 +501,10 @@ function state_toml()
         "booting" => BOOTING[],
         "startup_failed" => STARTUP_ERROR[],
         "idle_timeout" => IDLE_TTL[],
+        # Time since the last request was received or finished (= uptime until
+        # the first one); pings and `jld list` do not reset it.
+        "idle_for" => max(0.0, round(time() - LAST_ACTIVITY[], digits=1)),
+        "seen_request" => SEEN_REQUEST[],
     )
     if cur !== nothing
         d["current"] = first(cur.code, 120)

@@ -837,6 +837,13 @@ function cmd_interrupt(ctx, flags=Dict{String,Any}())
     cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
 end
 
+# Compact duration for "how long ago": 42s, 17m, 3.5h, 2.1d.
+fmt_ago(s::Real) =
+    s < 90 ? "$(round(Int, s))s" :
+    s < 90 * 60 ? "$(round(Int, s / 60))m" :
+    s < 48 * 3600 ? "$(round(s / 3600, digits=1))h" :
+    "$(round(s / 86400, digits=1))d"
+
 function cmd_status(ctx)
     st = try_ping(ctx.dir)
     dt = daemon_toml(ctx)
@@ -869,6 +876,11 @@ function cmd_status(ctx)
     println("pid:      ", st["pid"])
     println("julia:    ", st["julia_version"])
     println("uptime:   ", round(st["uptime"] / 60, digits=1), " min")
+    ifor = get(st, "idle_for", nothing)
+    if ifor isa Real && !st["busy"]
+        println("last:     ", get(st, "seen_request", true) ?
+            "$(fmt_ago(ifor)) ago" : "no requests served yet")
+    end
     it = get(st, "idle_timeout", 0.0)
     it isa Real && it > 0 && println("idle:     stops after $(round(Int, it))s without requests (--idle-timeout)")
     if dt !== nothing
@@ -887,7 +899,7 @@ function cmd_list(flags=Dict{String,Any}())
         nothing
     end
     showall = get(flags, "all", false)
-    rows = Vector{NTuple{6,String}}()
+    rows = Vector{NTuple{7,String}}()
     hidden = String[]
     # Row numbers are positions in known_ids() (what --id=N resolves against),
     # so they must not shift when dead daemons are hidden.
@@ -911,16 +923,18 @@ function cmd_list(flags=Dict{String,Any}())
               st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
         jver = dt !== nothing ? string(get(dt, "julia_version", "-")) : "-"
         proj = haskey(cfg, "checkout") ? string(cfg["checkout"], " (checkout)") : get(cfg, "project", "?")
-        push!(rows, (string(n), id, state, pid, jver, proj))
+        idle = st isa Dict && !st["busy"] && get(st, "idle_for", nothing) isa Real ?
+            fmt_ago(st["idle_for"]) : "-"
+        push!(rows, (string(n), id, state, idle, pid, jver, proj))
     end
     if isempty(rows)
         isempty(hidden) ? println("no daemons") :
             println("no running daemons ($(length(hidden)) dead not shown; `jld list --all`)")
         return
     end
-    header = ("#", "ID", "STATE", "PID", "JULIA", "PROJECT")
-    widths = [maximum(length.([header[i], (r[i] for r in rows)...])) for i in 1:5]
-    printrow(r; mark="  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:5], "  "), "  ", r[6])
+    header = ("#", "ID", "STATE", "IDLE", "PID", "JULIA", "PROJECT")
+    widths = [maximum(length.([header[i], (r[i] for r in rows)...])) for i in 1:6]
+    printrow(r; mark="  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:6], "  "), "  ", r[7])
     printrow(header)
     foreach(r -> printrow(r; mark=(r[2] == target ? "* " : "  ")), rows)
     ndead = count(r -> startswith(r[3], "dead"), rows)
