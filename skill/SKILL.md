@@ -15,6 +15,10 @@ are applied automatically before each request. Warm requests cost ~0.2s.
   `julia -e '<code>'` / `julia script.jl` for anything that loads project
   dependencies or the package under development.
 - The daemon autostarts on first use (that request pays the package load).
+  Include `--idle-timeout=2h` on commands that may autostart one (`jld eval`,
+  `jld run`, `jld start`) so daemons you leave behind stop themselves instead
+  of accumulating; it is recorded for restarts and ignored (harmlessly) when
+  the daemon is already running.
   The project is already active — never put `Pkg.activate(...)` in scripts.
   With no Project.toml anywhere upwards, the daemon serves the default user
   environment (like plain julia) — except in a julia source checkout, which
