@@ -108,6 +108,8 @@ const EVAL_TASK = Ref{Task}()
 const STATE_DIR = Ref("")
 const NAME = Ref("")
 const CHECKOUT = Ref("")  # julia source checkout served by this daemon ("" if none)
+# --testenv: activate the package's test environment at boot (jld --test).
+const TESTENV = Ref(false)
 # --idle-timeout: stop after this many seconds without requests (0 = never).
 const IDLE_TTL = Ref(0.0)
 const LAST_ACTIVITY = Ref(time())
@@ -254,6 +256,8 @@ function main(args::Vector{String})
             logfile = a[length("--log=")+1:end]
         elseif startswith(a, "--idle-timeout=")
             IDLE_TTL[] = something(tryparse(Float64, a[length("--idle-timeout=")+1:end]), 0.0)
+        elseif a == "--testenv"
+            TESTENV[] = true
         end
     end
     isempty(dir) && error("missing --dir")
@@ -296,8 +300,9 @@ function main(args::Vector{String})
 
     HAVE_REVISE && Core.eval(Main, :(import Revise))
 
-    if !isempty(startup)
+    if TESTENV[] || !isempty(startup)
         BOOTING[] = true
+        TESTENV[] && activate_testenv()
         for code in startup
             logmsg("running startup code: $(first(code, 200))")
             if !run_startup(code)
@@ -987,6 +992,24 @@ function save_full_error(e, bt)
             write(io, format_error(e, bt, false; collapse=false))
         end
     catch
+    end
+end
+
+# The test env replaces the active project, so it must be in place before any
+# --startup code or eval loads the package. Unlike failing --startup code this
+# is fatal: a --test daemon without the test environment would silently serve
+# the wrong dependencies, so exit and let the client surface the log.
+function activate_testenv()
+    logmsg("activating the test environment (TestEnv.activate())")
+    try
+        Core.eval(@__MODULE__, :(import TestEnv))
+        Base.invokelatest() do
+            TestEnv.activate()
+        end
+        logmsg("test environment active: $(something(Base.active_project(), "?"))")
+    catch e
+        logmsg("TestEnv.activate() failed: $(sprint(showerror, e, catch_backtrace()))")
+        exit(1)
     end
 end
 
