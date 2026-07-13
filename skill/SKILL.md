@@ -28,6 +28,12 @@ are applied automatically before each request. Warm requests cost ~0.2s.
   and `jld restart`.
 - `Main` state persists between requests like a REPL (including `ans`).
   Prefer fresh variable names; `jld restart` for a clean slate.
+- Daemons are shared per project: if other agents (or subagents you spawn)
+  may be working in the same project, give each its own daemon by passing
+  `--name=<unique>` on every jld command. Without it, concurrent agents
+  share one `Main`, and one agent's `restart`/`interrupt`/`stop` clobbers
+  the other's warm session. `--name` is not recorded — a single call
+  without it targets the shared default daemon.
 - Take `jld:`-prefixed warnings seriously: "Revise failed to apply changes"
   means the output came from STALE code — fix the file and rerun, or
   `jld restart` if it persists.
@@ -134,7 +140,8 @@ jld eval-repl '<code>'  paste code into the human's attached REPL (echoed + eval
 
 Flags: `--project=PATH` (default: nearest Project.toml, else the default
 environment like plain julia), `--name=N` / `JLD_NAME` (parallel daemons on
-one project — set this if another agent may share the directory),
+one project — required on every command when agents share a directory, see
+Rules),
 `--test` (separate daemon serving the package's test environment —
 test-only deps importable),
 `--id=ID` (target any existing daemon from `jld list`, any command),
