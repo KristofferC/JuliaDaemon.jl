@@ -60,6 +60,14 @@ it is the user's live REPL (`jld stop` is refused automatically).
 2. `jld run /path/to/scratch.jl`
 3. Edit package source, `jld run` again — the edit is live, no reload.
 
+If the code needs test-only dependencies (from `[extras]`/test target or
+`test/Project.toml`), add `--test`: it targets a separate daemon serving the
+package's test environment (the `test/` workspace project when the package
+declares one, else `TestEnv.activate()` at boot). The regular daemon is
+untouched; `--test` works with every command (`jld --test run scratch.jl`,
+`jld --test status`, ...). `jld --test run test/runtests.jl` runs the full
+suite warm — still prefer scratch subsets.
+
 Long-running commands: pass `--timeout=SECS`. It always terminates in bounded
 time with exit 124: the eval is interrupted (daemon and compile state
 survive), and only if it never yields is the daemon killed after a ~3s grace
@@ -127,6 +135,8 @@ jld eval-repl '<code>'  paste code into the human's attached REPL (echoed + eval
 Flags: `--project=PATH` (default: nearest Project.toml, else the default
 environment like plain julia), `--name=N` / `JLD_NAME` (parallel daemons on
 one project — set this if another agent may share the directory),
+`--test` (separate daemon serving the package's test environment —
+test-only deps importable),
 `--id=ID` (target any existing daemon from `jld list`, any command),
 `--module=M` (eval/run in module Main.M instead of Main),
 `--julia=BIN` / `JLD_JULIA` (daemon's julia, e.g. an in-tree build),

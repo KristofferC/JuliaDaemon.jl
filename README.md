@@ -93,6 +93,25 @@ Both take:
   this flag they fail fast instead (exit 3), for callers that only want an
   already-warm daemon.
 
+### Test environments
+
+`jld --test <cmd>` serves the package's *test* environment: test-only
+dependencies are importable, so test code runs as it does under `Pkg.test()`,
+but warm. It is a separate daemon (`<Pkg>-test-…` in `jld list`) beside the
+regular one, and `--test` selects it for every command (`status`, `restart`,
+`connect`, …).
+
+If the package declares `test/` as a workspace project (`[workspace]`
+`projects = ["test"]` in Project.toml), the daemon simply runs with `test/`
+as the active project. Otherwise it activates the test environment at boot
+with [TestEnv.jl](https://github.com/JuliaTesting/TestEnv.jl), which jld
+installs into its private environment on first use.
+
+```sh
+jld --test run test/runtests.jl        # the full suite, warm
+jld --test eval 'using Test, MyPkg; …' # anything needing test-only deps
+```
+
 ### Lifecycle
 
 - `jld start` — start the daemon ahead of time. `--startup='using MyPkg'`
@@ -174,6 +193,9 @@ These work with every command; the eval-specific ones are listed above.
   environment.
 - `--name=NAME` (env `JLD_NAME`) — a separate daemon for the same project.
   Handy when several agents share a directory.
+- `--test` — serve the package's test environment in a separate daemon
+  (test-only deps importable; see
+  [Test environments](#test-environments)).
 - `--id=ID` — target a specific daemon from `jld list`: the full id, any
   unique part of it, or its row number.
 - `--julia=BIN` (env `JLD_JULIA`) — which julia the daemon runs.

@@ -30,6 +30,8 @@ cleanup() {
     for n in $NAME iso idle; do
         "$JLD" --project="$WORK/ToyPkg" --name=$n kill >/dev/null 2>&1
     done
+    "$JLD" --project="$WORK/ToyPkg" --name=$NAME --test kill >/dev/null 2>&1
+    "$JLD" --project="$WORK/WsPkg" --name=$NAME --test kill >/dev/null 2>&1
     [ -n "$SESSPID" ] && kill -9 $SESSPID >/dev/null 2>&1
     rm -rf "$WORK"
 }
@@ -41,6 +43,15 @@ cat > "$WORK/ToyPkg/src/ToyPkg.jl" <<'EOF'
 module ToyPkg
 greet() = print("Hello World!")
 end
+EOF
+# Classic test target, for the --test (TestEnv mode) checks.
+cat >> "$WORK/ToyPkg/Project.toml" <<'EOF'
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
 EOF
 cd "$WORK/ToyPkg"
 J="$JLD --name=$NAME"
@@ -211,6 +222,58 @@ checkout "no-revise: restart --revise re-enables" "true" "$out"
 
 out=$($JLD --project="$WORK/ToyPkg" list 2>&8)
 checkout "list shows both daemons" "ToyPkg-iso" "$out"
+
+# ---- --test: test-environment daemons ----
+
+# TestEnv mode: ToyPkg has a classic [extras]/[targets] setup, so the test
+# daemon activates via TestEnv at boot. Its active project is a sandbox that
+# has ToyPkg as a *dependency* — the package's own Project.toml never does.
+sandbox_check='import TOML; haskey(get(TOML.parsefile(Base.active_project()), "deps", Dict()), "ToyPkg") ? "test env active" : "test env NOT active"'
+out=$($J --test eval 'using Test, ToyPkg; ToyPkg.double(2)' 2>&8)
+check "test daemon starts (TestEnv mode)" 0 $?
+checkout "package + test deps load" "4" "$out"
+out=$($J --test eval "$sandbox_check" 2>&8)
+checkout "TestEnv sandbox is the active project" "test env active" "$out"
+out=$($J --test eval 'td_var = 1;' 2>&8; $J eval 'isdefined(Main, :td_var)' 2>&8)
+checkout "test daemon is separate from the regular one" "false" "$out"
+out=$($JLD --project="$WORK/ToyPkg" list 2>&8)
+checkout "test daemon listed with test marker" "ToyPkg-$NAME-test" "$out"
+$JLD --id="ToyPkg-$NAME-test" restart >/dev/null 2>&8
+out=$($J --test --no-autostart eval "$sandbox_check" 2>&8)
+checkout "restart by id keeps the test env" "test env active" "$out"
+
+# Workspace mode: a package that declares test/ as a workspace project is
+# served with test/ active directly — no TestEnv. Needs a Pkg with workspace
+# support (probed functionally, skipped otherwise); the manifest must be
+# resolved by the daemon's julia.
+DJULIA="${JLD_JULIA:-julia}"
+julia --startup-file=no -e "using Pkg; Pkg.generate(\"$WORK/WsPkg\")" >/dev/null 2>&8
+cat > "$WORK/WsPkg/src/WsPkg.jl" <<'EOF'
+module WsPkg
+triple(x) = 3x
+end
+EOF
+cat >> "$WORK/WsPkg/Project.toml" <<'EOF'
+
+[workspace]
+projects = ["test"]
+EOF
+mkdir -p "$WORK/WsPkg/test"
+WSUUID=$(julia --startup-file=no -e "import TOML; print(TOML.parsefile(\"$WORK/WsPkg/Project.toml\")[\"uuid\"])" 2>&8)
+cat > "$WORK/WsPkg/test/Project.toml" <<EOF
+[deps]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+WsPkg = "$WSUUID"
+EOF
+if "$DJULIA" --startup-file=no --project="$WORK/WsPkg" -e 'using Pkg; Pkg.resolve()' >/dev/null 2>&8 &&
+   "$DJULIA" --startup-file=no --project="$WORK/WsPkg/test" -e 'using WsPkg' >/dev/null 2>&8; then
+    out=$($JLD --project="$WORK/WsPkg" --name=$NAME --test eval 'using Test, WsPkg; string(WsPkg.triple(3), " in ", basename(dirname(Base.active_project())))' 2>&8)
+    check "workspace test daemon starts" 0 $?
+    checkout "test/ is the active project" "9 in test" "$out"
+    $JLD --project="$WORK/WsPkg" --name=$NAME --test kill >/dev/null 2>&1
+else
+    echo "skip: workspace --test (this julia's Pkg lacks workspace support)"
+fi
 
 # ---- transcript ----
 

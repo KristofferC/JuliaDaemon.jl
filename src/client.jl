@@ -67,6 +67,7 @@ struct Ctx
     dir::String
     julia::String
     checkout::String  # julia source checkout served via a scratch env ("" if none)
+    test::String      # --test: "" | "workspace" | "testenv"
 end
 
 function find_project(flag)
@@ -143,11 +144,43 @@ function checkout_env(checkout)
     realpath(dir)
 end
 
+project_file(dir) = (p = joinpath(dir, "JuliaProject.toml"); isfile(p) ? p :
+                    (p = joinpath(dir, "Project.toml"); isfile(p) ? p : nothing))
+
+# --test: locate the package (the nearest named project at or above `project`,
+# so it also works from inside test/ or docs/) and decide how its test
+# environment is provided: the test/ workspace project is served directly when
+# the package declares one, anything else goes through TestEnv.activate() at
+# daemon boot.
+function resolve_test(project)
+    d, prj = project, nothing
+    while true
+        pf = project_file(d)
+        prj = pf === nothing ? nothing : read_toml(pf)
+        prj !== nothing && haskey(prj, "name") && break
+        nd = dirname(d)
+        nd == d && die("--test requires a package, but no Project.toml with a `name` was found at or above $project")
+        d = nd
+    end
+    tdir = joinpath(d, "test")
+    ws = get(prj, "workspace", nothing)
+    members = ws isa Dict ? get(ws, "projects", Any[]) : Any[]
+    isws = project_file(tdir) !== nothing &&
+           any(p -> p isa AbstractString && normpath(joinpath(d, p)) == normpath(tdir), members)
+    (d, isws ? "workspace" : "testenv")
+end
+
 function make_ctx(flags)
     julia = get(flags, "julia", get(ENV, "JLD_JULIA", "julia"))
     explicit = haskey(flags, "julia") || !isempty(get(ENV, "JLD_JULIA", ""))
     project = find_project(get(flags, "project", nothing))
     checkout = project === nothing ? find_checkout() : nothing
+    test = ""
+    if get(flags, "test", false)
+        checkout === nothing || die("--test cannot serve a julia checkout")
+        project === nothing && die("--test requires a package; no Project.toml found (pass --project=<pkg>)")
+        project, test = resolve_test(project)
+    end
     if checkout !== nothing
         if !explicit
             intree = joinpath(checkout, "usr", "bin", Sys.iswindows() ? "julia.exe" : "julia")
@@ -162,16 +195,19 @@ function make_ctx(flags)
     project === nothing && die("no project found and cannot resolve a default environment; pass --project=<path>")
     name = get(flags, "name", get(ENV, "JLD_NAME", ""))
     slug = replace(basename(project), r"[^A-Za-z0-9_.-]" => "-")
-    h = bytes2hex(sha1(project * "\0" * name))[1:8]
-    id = isempty(name) ? "$slug-$h" : "$slug-$name-$h"
+    h = bytes2hex(sha1(project * "\0" * name * (isempty(test) ? "" : "\0test")))[1:8]
+    id = join(filter(!isempty, [slug, name, isempty(test) ? "" : "test", h]), "-")
     dir = joinpath(cache_root(), id)
+    # Identity stays keyed to the package root; what the daemon serves in
+    # workspace mode is the test project itself.
+    test == "workspace" && (project = joinpath(project, "test"))
     # Fresh checkout daemon: track Base by default (recorded at start, so an
     # explicit --startup or a recorded config takes precedence from then on).
     if checkout !== nothing && !haskey(flags, "startup") && !get(flags, "no-revise", false) &&
        !isfile(joinpath(dir, "config.toml"))
         flags["startup"] = ["Revise.track(Base)"]
     end
-    Ctx(project, name, id, dir, jpath, something(checkout, ""))
+    Ctx(project, name, id, dir, jpath, something(checkout, ""), test)
 end
 
 # ---- daemon environment (per julia minor version) ----
@@ -284,6 +320,18 @@ function revise_loads(julia, project, envdir)
     env["JULIA_LOAD_PATH"] = join(["@", envdir, "@stdlib"], sep)
     cmd = `$julia --startup-file=no --project=$project -e 'import Revise'`
     run_capture(cmd, env)
+end
+
+# TestEnv is only needed by --test daemons; it is added to the jld env on
+# first use so regular setups don't pay for it.
+function ensure_testenv(julia, envdir)
+    prj = read_toml(joinpath(envdir, "Project.toml"))
+    prj !== nothing && haskey(get(prj, "deps", Dict{String,Any}()), "TestEnv") && return
+    info("adding TestEnv to @$(basename(envdir)) (one-time, used by --test daemons)...")
+    env = default_julia_env()
+    env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
+    ok, out = run_capture(`$julia --startup-file=no --project=$envdir -e $(pkg_add_code(["TestEnv"]))`, env)
+    ok || (print(stderr, out); die("failed to add TestEnv to @$(basename(envdir)) (see errors above)"))
 end
 
 # The registry's Revise stack lags julia master; the master branches are the
@@ -411,6 +459,7 @@ function cmd_start(ctx, flags)
     dbg("start: julia $ver at $julia")
     envdir = ensure_env(julia, ver)
     dbg("start: env ready at $envdir")
+    ctx.test == "testenv" && ensure_testenv(julia, envdir)
 
     startup = get(flags, "startup", String[])
     threads = get(flags, "threads", nothing)
@@ -422,6 +471,7 @@ function cmd_start(ctx, flags)
         "startup" => startup,
     )
     isempty(ctx.checkout) || (cfg["checkout"] = ctx.checkout)
+    isempty(ctx.test) || (cfg["test"] = ctx.test)
     threads !== nothing && (cfg["threads"] = threads)
     norevise && (cfg["no_revise"] = true)
     idle > 0 && (cfg["idle_timeout"] = idle)
@@ -448,6 +498,7 @@ function cmd_start(ctx, flags)
     dargs = ["--dir=$(ctx.dir)"]
     append!(dargs, ["--startup=$s" for s in startup])
     idle > 0 && push!(dargs, "--idle-timeout=$idle")
+    ctx.test == "testenv" && push!(dargs, "--testenv")
 
     Sys.iswindows() && push!(dargs, "--log=$(log_path(ctx))")
     cmd = `$julia $jargs $(joinpath(JLD_HOME, "src", "daemon_main.jl")) $dargs`
@@ -504,7 +555,9 @@ function cmd_start(ctx, flags)
             return
         end
         if time() - lastmsg > 5
-            info(st isa Dict ? "running startup code... ($(round(Int, time() - t0))s)" :
+            info(st isa Dict ? (ctx.test == "testenv" ?
+                     "activating the test environment... ($(round(Int, time() - t0))s)" :
+                     "running startup code... ($(round(Int, time() - t0))s)") :
                                "waiting for daemon to load... ($(round(Int, time() - t0))s)")
             lastmsg = time()
         end
@@ -525,7 +578,7 @@ function apply_cfg(ctx, flags, cfg)
         (flags["no-revise"] = get(cfg, "no_revise", false))
     if !haskey(flags, "julia") && !haskey(ENV, "JLD_JULIA")
         j = get(cfg, "julia", "")
-        isfile(j) && return Ctx(ctx.project, ctx.name, ctx.id, ctx.dir, j, ctx.checkout)
+        isfile(j) && return Ctx(ctx.project, ctx.name, ctx.id, ctx.dir, j, ctx.checkout, ctx.test)
     end
     ctx
 end
@@ -848,8 +901,10 @@ function cmd_status(ctx)
     st = try_ping(ctx.dir)
     dt = daemon_toml(ctx)
     println("id:       ", ctx.id)
+    tsuf = ctx.test == "testenv" ? " (test env via TestEnv.activate())" :
+           ctx.test == "workspace" ? " (test workspace project)" : ""
     isempty(ctx.checkout) ?
-        println("project:  ", ctx.project) :
+        println("project:  ", ctx.project, tsuf) :
         println("project:  ", ctx.checkout, " (checkout; scratch env ", ctx.project, ")")
     if !(st isa Dict)
         pid = dt === nothing ? nothing : get(dt, "pid", nothing)
@@ -923,6 +978,7 @@ function cmd_list(flags=Dict{String,Any}())
               st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
         jver = dt !== nothing ? string(get(dt, "julia_version", "-")) : "-"
         proj = haskey(cfg, "checkout") ? string(cfg["checkout"], " (checkout)") : get(cfg, "project", "?")
+        isempty(get(cfg, "test", "")) || (proj = string(proj, " (test)"))
         idle = st isa Dict && !st["busy"] && get(st, "idle_for", nothing) isa Real ?
             fmt_ago(st["idle_for"]) : "-"
         push!(rows, (string(n), id, state, idle, pid, jver, proj))
@@ -976,7 +1032,7 @@ function ctx_from_known(id)
     cfg = read_toml(joinpath(dir, "config.toml"))
     cfg === nothing && die("unreadable daemon state in $dir")
     Ctx(get(cfg, "project", ""), get(cfg, "name", ""), id, dir, get(cfg, "julia", "julia"),
-        get(cfg, "checkout", ""))
+        get(cfg, "checkout", ""), get(cfg, "test", ""))
 end
 
 # With no project and no id: prefer the daemon `jld eval` would target (the
@@ -1183,6 +1239,7 @@ function cmd_setup(ctx, flags=Dict{String,Any}())
     ver, julia = probe_julia(ctx.julia, ctx.project)
     dev = get(flags, "dev", false)
     envdir = ensure_env(julia, ver, force=!dev)
+    ctx.test == "testenv" && ensure_testenv(julia, envdir)
     if dev
         iok, iout = install_dev_stack(julia, envdir)
         iok || (print(stderr, iout); die("master install failed (see errors above)"))
@@ -1233,6 +1290,10 @@ flags:
   --project=PATH    project to serve (default: JULIA_PROJECT, nearest Project.toml,
                     or the default environment — like plain julia)
   --name=NAME       distinct daemon for the same project (env: JLD_NAME)
+  --test            serve the package's test environment as a separate daemon
+                    (test-only deps are importable); uses the test/ workspace
+                    project directly when the package declares one, otherwise
+                    TestEnv.activate() at boot. Works with every command
   --id=ID           target an existing daemon: id, any unique part of it, or its
                     row number in `jld list`; works with every command
   --module=M        eval/run: evaluate in module Main.M instead of Main (created on demand)
@@ -1284,7 +1345,7 @@ function parse_cli(args)
                 end
             else
                 k = a[3:end]
-                k in ("no-autostart", "print", "follow", "help", "scratch", "no-revise", "revise", "all", "dev", "force") || die("unknown flag --$k")
+                k in ("no-autostart", "print", "follow", "help", "scratch", "no-revise", "revise", "all", "dev", "force", "test") || die("unknown flag --$k")
                 flags[k] = true
             end
         else
