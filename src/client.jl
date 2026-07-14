@@ -418,6 +418,15 @@ end
 
 ping_alive(dir) = try_ping(dir) isa Dict
 
+# Probe many ids concurrently, keeping those where `probe` returns true:
+# sequential probes are linear in daemon count, and one wedged daemon stalls
+# everything behind it for the full ping timeout.
+function filter_probing(probe::Function, ids)
+    tasks = [@async probe(id) for id in ids]
+    [id for (id, t) in zip(ids, tasks) if fetch(t)]
+end
+running_ids(ids=known_ids()) = filter_probing(id -> ping_alive(joinpath(cache_root(), id)), ids)
+
 read_toml(path) = isfile(path) ? (try TOML.parsefile(path) catch; nothing end) : nothing
 daemon_toml(ctx) = read_toml(joinpath(ctx.dir, "daemon.toml"))
 config_toml(ctx) = read_toml(joinpath(ctx.dir, "config.toml"))
@@ -598,7 +607,7 @@ function ensure_running(ctx, flags)
     # do by accident (e.g. forgetting --id in a project-less directory); say so.
     if !haskey(flags, "id") && find_project(get(flags, "project", nothing)) === nothing &&
        find_checkout() === nothing
-        others = filter(id -> id != ctx.id && ping_alive(joinpath(cache_root(), id)), known_ids())
+        others = running_ids(filter(!=(ctx.id), known_ids()))
         isempty(others) ||
             info("no project here — autostarting a default-environment daemon; other running daemons: $(join(others, ", ")) (`--id` targets one)")
     end
@@ -1023,7 +1032,7 @@ function ctx_from_id(idarg)
     isempty(matches) && die("no daemon matching \"$idarg\" (see `jld list`)", 3)
     if length(matches) > 1 && !(idarg in matches)
         # Prefer a unique running daemon over dead prefix-siblings.
-        running = filter(id -> ping_alive(joinpath(cache_root(), id)), matches)
+        running = running_ids(matches)
         length(running) == 1 ||
             die("ambiguous id \"$idarg\": matches $(join(matches, ", "))")
         matches = running
@@ -1046,7 +1055,7 @@ end
 function ctx_from_only_running(flags, exists::Function)
     ctx = make_ctx(flags)
     exists(ctx) && return ctx
-    running = filter(id -> ping_alive(joinpath(cache_root(), id)), known_ids())
+    running = running_ids()
     isempty(running) && die("no running daemons", 3)
     if length(running) > 1
         info("multiple daemons running; pick one with `--id=<id>`:")
@@ -1077,7 +1086,7 @@ function ctx_for_eval_repl(flags)
     find_project(get(flags, "project", nothing)) !== nothing && return make_ctx(flags)
     ctx = make_ctx(flags)
     sock_serving(live_input_sock(ctx.dir)) && return ctx
-    attached = filter(id -> sock_serving(live_input_sock(joinpath(cache_root(), id))), known_ids())
+    attached = filter_probing(id -> sock_serving(live_input_sock(joinpath(cache_root(), id))), known_ids())
     isempty(attached) && die("no attached REPL found; start one with `jld connect`", 3)
     length(attached) > 1 &&
         die("multiple attached REPLs ($(join(attached, ", "))); pass --id", 3)
@@ -1087,9 +1096,14 @@ end
 # Remove state directories (config, log, transcript) of dead daemons.
 function cmd_gc()
     removed = 0
-    for id in known_ids()
+    ids = known_ids()
+    # Ping every daemon concurrently (same reason as cmd_list): sequential
+    # pings make gc linear in daemon count, and one wedged daemon would add
+    # its full ping timeout.
+    pings = [@async try_ping(joinpath(cache_root(), id)) for id in ids]
+    for (n, id) in enumerate(ids)
         dir = joinpath(cache_root(), id)
-        try_ping(dir) === nothing || continue  # running or unresponsive: keep
+        fetch(pings[n]) === nothing || continue  # running or unresponsive: keep
         dt = read_toml(joinpath(dir, "daemon.toml"))
         pid = dt === nothing ? nothing : get(dt, "pid", nothing)
         pid !== nothing && pid_alive(pid) && pid_is_julia(pid) && continue
