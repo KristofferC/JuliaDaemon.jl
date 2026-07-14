@@ -103,6 +103,33 @@ from inside it use the in-tree julia, a jld-managed scratch environment, and
   setup, interleaving its output with your result. When you care about reading
   the result cleanly (or the env is fresh), run `jld start` first — it prints
   only progress plus a final `daemon ready`, then evals come back clean.
+- If package precompilation inside a checkout daemon crashes with
+  `could not load symbol "jl_..."`, the in-tree build is internally
+  inconsistent (runtime rebuilt without a full `make`, so the sysimage
+  ccalls a symbol the new runtime dropped). No jld option works around it —
+  the checkout needs a full `make -j` first.
+
+### Core.Compiler
+
+The sysimage compiler (`Base.Compiler`) cannot be Revise'd; develop the
+checkout's `Compiler/` package into the daemon's environment instead:
+
+    jld eval 'import Pkg; Pkg.develop(path="/path/to/checkout/Compiler")'
+    jld restart      # required, see below
+    jld eval 'using Compiler; ...'
+
+The restart is not optional: the daemon's Revise stack already loaded the
+registry copy of Compiler.jl at boot (a LoweredCodeUtils dependency), so in
+the same session `using Compiler` binds that stale copy — Pkg hints at this
+with `[loaded: ~/.julia/packages/Compiler/... expected ...]`. After the
+restart, edits under `Compiler/src/` hot-reload like any package, including
+re-run top-level registrations such as `add_tfunc`.
+
+To route reflection (`code_typed`, `Base.infer_return_type`, ...) through
+the loaded module: `Compiler.activate!()` on 1.12, or
+`using InteractiveUtils; @activate Compiler` on 1.13+. When probing a
+change, use a signature that has not been inferred yet — inference results
+are cached per signature, and table mutations do not invalidate them.
 
 ## Interrupting
 
