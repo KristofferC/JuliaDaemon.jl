@@ -47,12 +47,32 @@ function sock_serving(path)
     true
 end
 
+# Bounded wait for a task. timedwait polls, and its pollint puts a ~50ms
+# floor on even an instant reply — which multiplies across sequential waits
+# (two per ping, one ping per daemon in `jld list`). A waiter task closing
+# the timer the moment `t` finishes makes the wait event-driven instead.
+function task_done_within(t::Task, timeout::Real)
+    timer = Timer(timeout)
+    @async (try wait(t) catch end; close(timer))
+    try
+        wait(timer)      # returns when the timeout fires
+    catch                # timer closed: the task finished first
+    finally
+        close(timer)
+    end
+    istaskdone(t)
+end
+
 function write_frame(io::IO, kind::AbstractString, payload::AbstractString="")
     data = codeunits(payload)
     buf = IOBuffer(sizehint=length(data) + 16)
     write(buf, kind, ' ', string(length(data)), '\n', data)
     write(io, take!(buf))
-    flush(io)
+    # No flush: on libuv sockets write() already blocks until the bytes are
+    # handed to the OS, and flush() issues a zero-length uv_write that throws
+    # a spurious EPIPE when the peer answered and closed in the meantime
+    # (one-shot exchanges like ping race this whenever the event loop is busy,
+    # e.g. `jld list` pinging every daemon concurrently).
     nothing
 end
 

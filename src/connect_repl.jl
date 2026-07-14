@@ -101,7 +101,7 @@ function LineEdit.complete_line(::RemoteCompletions, s::LineEdit.PromptState; hi
         write_frame(conn, "complete",
                     sprint(io -> TOML.print(io, Dict("partial" => partial, "full" => full))))
         t = @async read_frame(conn)
-        if timedwait(() -> istaskdone(t), 3.0; pollint=0.05) === :ok
+        if task_done_within(t, 3.0)
             kind, payload = fetch(t)
             if kind == "completions"
                 d = TOML.parse(payload)

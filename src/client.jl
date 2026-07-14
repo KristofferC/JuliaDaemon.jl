@@ -385,7 +385,7 @@ function try_ping(dir; timeout=5.0)
     conn = nothing
     for attempt in 1:2
         c = @async connect(sock)
-        if timedwait(() -> istaskdone(c), timeout; pollint=0.05) !== :ok
+        if !task_done_within(c, timeout)
             dbg("ping: connect timed out")
             return :timeout
         end
@@ -405,7 +405,7 @@ function try_ping(dir; timeout=5.0)
     try
         write_frame(conn, "ping")
         t = @async read_frame(conn)
-        timedwait(() -> istaskdone(t), timeout; pollint=0.05) === :ok || return :timeout
+        task_done_within(t, timeout) || return :timeout
         kind, payload = fetch(t)
         kind == "pong" || return nothing
         return TOML.parse(payload)
@@ -825,7 +825,7 @@ end
 # waiting the eval out.
 function send_interrupt_frame(ctx; timeout=2.0)
     c = @async connect(live_sock(ctx.dir))
-    timedwait(() -> istaskdone(c), timeout; pollint=0.05) === :ok || return false
+    task_done_within(c, timeout) || return false
     conn = try
         fetch(c)
     catch
@@ -834,7 +834,7 @@ function send_interrupt_frame(ctx; timeout=2.0)
     try
         write_frame(conn, "interrupt")
         t = @async read_frame(conn)
-        timedwait(() -> istaskdone(t), timeout; pollint=0.05) === :ok || return false
+        task_done_within(t, timeout) || return false
         kind, payload = fetch(t)
         kind == "done" && contains(payload, "ok")
     catch
@@ -956,13 +956,18 @@ function cmd_list(flags=Dict{String,Any}())
     showall = get(flags, "all", false)
     rows = Vector{NTuple{7,String}}()
     hidden = String[]
+    ids = known_ids()
+    # Ping every daemon concurrently: sequential pings make the list linear in
+    # daemon count, and one wedged daemon would stall every row behind it for
+    # the full ping timeout.
+    pings = [@async try_ping(joinpath(root, id)) for id in ids]
     # Row numbers are positions in known_ids() (what --id=N resolves against),
     # so they must not shift when dead daemons are hidden.
-    for (n, id) in enumerate(known_ids())
+    for (n, id) in enumerate(ids)
         dir = joinpath(root, id)
         cfg = read_toml(joinpath(dir, "config.toml"))
         cfg === nothing && continue
-        st = try_ping(dir)
+        st = fetch(pings[n])
         session = (st isa Dict ? get(st, "kind", "") : get(cfg, "kind", "")) == "session"
         state = st isa Dict ? (get(st, "booting", false) ? "starting" : st["busy"] ? "busy" : "idle") :
                 st === :timeout ? "unresponsive" : "dead"
