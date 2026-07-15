@@ -6,7 +6,7 @@
 function inject_input(data::AbstractString)
     tty = stdin
     lock(tty.cond)
-    try
+    return try
         write(tty.buffer, data)
         notify(tty.cond)
     finally
@@ -33,14 +33,14 @@ function stash_pending_input()
 end
 
 function serve_input(sockpath)
-    Sys.iswindows() || rm(sockpath, force=true)
+    Sys.iswindows() || rm(sockpath, force = true)
     server = try
         Sockets.listen(sockpath)
     catch err
         @error "jld: cannot serve eval-repl requests" exception = err
         return
     end
-    atexit(() -> Sys.iswindows() || rm(sockpath, force=true))
+    atexit(() -> Sys.iswindows() || rm(sockpath, force = true))
     while true
         conn = try
             Sockets.accept(server)
@@ -71,4 +71,5 @@ function serve_input(sockpath)
             end
         end
     end
+    return
 end

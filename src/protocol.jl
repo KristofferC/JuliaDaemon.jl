@@ -25,15 +25,15 @@ function sock_runtime_dir()
         base = joinpath(base, "jld")
     end
     isdir(base) || (mkpath(base); chmod(base, 0o700))
-    base
+    return base
 end
 
 sock_tag(dir) = bytes2hex(JLD_SHA.sha1(abspath(dir)))[1:16]
 
 daemon_sock(dir) = Sys.iswindows() ? "\\\\.\\pipe\\jld-" * sock_tag(dir) :
-                   joinpath(sock_runtime_dir(), sock_tag(dir) * ".sock")
+    joinpath(sock_runtime_dir(), sock_tag(dir) * ".sock")
 input_sock(dir) = Sys.iswindows() ? "\\\\.\\pipe\\jld-" * sock_tag(dir) * "-r" :
-                  joinpath(sock_runtime_dir(), sock_tag(dir) * "-r.sock")
+    joinpath(sock_runtime_dir(), sock_tag(dir) * "-r.sock")
 
 # Whether something serves the endpoint right now (pipes have no fs entry, so
 # probing means connecting).
@@ -44,7 +44,7 @@ function sock_serving(path)
         return false
     end
     close(conn)
-    true
+    return true
 end
 
 # Bounded wait for a task. timedwait polls, and its pollint puts a ~50ms
@@ -53,19 +53,23 @@ end
 # the timer the moment `t` finishes makes the wait event-driven instead.
 function task_done_within(t::Task, timeout::Real)
     timer = Timer(timeout)
-    @async (try wait(t) catch end; close(timer))
+    @async (
+        try
+            wait(t)
+        catch end; close(timer)
+    )
     try
         wait(timer)      # returns when the timeout fires
     catch                # timer closed: the task finished first
     finally
         close(timer)
     end
-    istaskdone(t)
+    return istaskdone(t)
 end
 
-function write_frame(io::IO, kind::AbstractString, payload::AbstractString="")
+function write_frame(io::IO, kind::AbstractString, payload::AbstractString = "")
     data = codeunits(payload)
-    buf = IOBuffer(sizehint=length(data) + 16)
+    buf = IOBuffer(sizehint = length(data) + 16)
     write(buf, kind, ' ', string(length(data)), '\n', data)
     write(io, take!(buf))
     # No flush: on libuv sockets write() already blocks until the bytes are
@@ -73,7 +77,7 @@ function write_frame(io::IO, kind::AbstractString, payload::AbstractString="")
     # a spurious EPIPE when the peer answered and closed in the meantime
     # (one-shot exchanges like ping race this whenever the event loop is busy,
     # e.g. `jld list` pinging every daemon concurrently).
-    nothing
+    return nothing
 end
 
 function read_frame(io::IO)
@@ -85,5 +89,5 @@ function read_frame(io::IO)
     (len === nothing || len < 0 || len > MAX_FRAME) && return ("eof", "")
     data = read(io, len)
     length(data) == len || return ("eof", "")
-    (String(parts[1]), String(data))
+    return (String(parts[1]), String(data))
 end
