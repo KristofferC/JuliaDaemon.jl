@@ -1,11 +1,11 @@
 # jld client: talks to a per-project Julia daemon over a unix socket.
 # Runs with --compile=min and only stdlib deps, so it starts fast.
 
-using Sockets
-using TOML
-using SHA
+using Sockets: Sockets, connect
+using TOML: TOML
+using SHA: SHA, sha1
 
-include(joinpath(@__DIR__, "protocol.jl"))
+include("protocol.jl")
 
 const JLD_HOME = dirname(@__DIR__)
 const DAEMON_DEPS = ["Revise"]
@@ -17,7 +17,7 @@ const SIGKILL_ = Cint(9)
 
 info(msg) = println(stderr, "jld: ", msg)
 dbg(msg) = haskey(ENV, "JLD_DEBUG") && info("debug [$(Libc.strftime("%H:%M:%S", time()))]: " * msg)
-die(msg, code=2) = (info(msg); exit(code))
+die(msg, code = 2) = (info(msg); exit(code))
 
 uv_kill(pid, sig) = ccall(:uv_kill, Cint, (Cint, Cint), pid, sig)
 pid_alive(pid) = uv_kill(pid, Cint(0)) == 0
@@ -47,7 +47,7 @@ function live_sock(dir)
         legacy = joinpath(dir, "sock")
         sock_serving(legacy) && return legacy
     end
-    s
+    return s
 end
 
 function live_input_sock(dir)
@@ -57,7 +57,7 @@ function live_input_sock(dir)
         legacy = joinpath(dir, "repl.sock")
         sock_serving(legacy) && return legacy
     end
-    s
+    return s
 end
 
 struct Ctx
@@ -95,6 +95,7 @@ function find_project(flag)
         nd == d && return nothing
         d = nd
     end
+    return
 end
 
 # No project anywhere upwards: fall back to the default environment, like
@@ -114,7 +115,7 @@ function default_env_project(jpath)
         path = joinpath(dirname(path), "v" * minor_of(ver))
     end
     mkpath(path)
-    realpath(path)
+    return realpath(path)
 end
 
 # A julia source checkout has no top-level Project.toml; recognize it so bare
@@ -130,6 +131,7 @@ function find_checkout()
         nd == d && return nothing
         d = nd
     end
+    return
 end
 
 # Scratch project for a checkout daemon, keyed by checkout path. Kept empty on
@@ -141,11 +143,13 @@ function checkout_env(checkout)
     mkpath(dir)
     toml = joinpath(dir, "Project.toml")
     isfile(toml) || touch(toml)
-    realpath(dir)
+    return realpath(dir)
 end
 
-project_file(dir) = (p = joinpath(dir, "JuliaProject.toml"); isfile(p) ? p :
-                    (p = joinpath(dir, "Project.toml"); isfile(p) ? p : nothing))
+project_file(dir) = (
+    p = joinpath(dir, "JuliaProject.toml"); isfile(p) ? p :
+        (p = joinpath(dir, "Project.toml"); isfile(p) ? p : nothing)
+)
 
 # --test: locate the package (the nearest named project at or above `project`,
 # so it also works from inside test/ or docs/) and decide how its test
@@ -166,8 +170,8 @@ function resolve_test(project)
     ws = get(prj, "workspace", nothing)
     members = ws isa Dict ? get(ws, "projects", Any[]) : Any[]
     isws = project_file(tdir) !== nothing &&
-           any(p -> p isa AbstractString && normpath(joinpath(d, p)) == normpath(tdir), members)
-    (d, isws ? "workspace" : "testenv")
+        any(p -> p isa AbstractString && normpath(joinpath(d, p)) == normpath(tdir), members)
+    return (d, isws ? "workspace" : "testenv")
 end
 
 function make_ctx(flags)
@@ -193,10 +197,10 @@ function make_ctx(flags)
     jpath === nothing && die("julia executable not found: $julia")
     project === nothing && (project = default_env_project(explicit ? jpath : nothing))
     project === nothing && die("no project found and cannot resolve a default environment; pass --project=<path>")
-    name = get(flags, "name", get(ENV, "JLD_NAME", ""))
+    name = get(flags, "name", get(ENV, "JLD_NAME", ""))::AbstractString
     slug = replace(basename(project), r"[^A-Za-z0-9_.-]" => "-")
-    h = bytes2hex(sha1(project * "\0" * name * (isempty(test) ? "" : "\0test")))[1:8]
-    id = join(filter(!isempty, [slug, name, isempty(test) ? "" : "test", h]), "-")
+    h = bytes2hex(sha1(string(project, "\0", name, isempty(test) ? "" : "\0test")))[1:8]
+    id = join(filter(!isempty, [slug, name, isempty(test) ? "" : "test", h]), "-")::String
     dir = joinpath(cache_root(), id)
     # Identity stays keyed to the package root; what the daemon serves in
     # workspace mode is the test project itself.
@@ -204,10 +208,10 @@ function make_ctx(flags)
     # Fresh checkout daemon: track Base by default (recorded at start, so an
     # explicit --startup or a recorded config takes precedence from then on).
     if checkout !== nothing && !haskey(flags, "startup") && !get(flags, "no-revise", false) &&
-       !isfile(joinpath(dir, "config.toml"))
+            !isfile(joinpath(dir, "config.toml"))
         flags["startup"] = ["Revise.track(Base)"]
     end
-    Ctx(project, name, id, dir, jpath, something(checkout, ""), test)
+    return Ctx(project, name, id, dir, jpath, something(checkout, ""), test)
 end
 
 # ---- daemon environment (per julia minor version) ----
@@ -219,7 +223,7 @@ function default_julia_env()
     env = copy(ENV)
     delete!(env, "JULIA_LOAD_PATH")
     delete!(env, "JULIA_PROJECT")
-    env
+    return env
 end
 
 # Resolve which julia actually runs for this project and where it lives.
@@ -236,7 +240,7 @@ function probe_julia(julia, project)
     length(parts) == 2 || die("unexpected julia probe output: \"$out\"")
     ver, bindir = String(parts[1]), String(parts[2])
     bin = joinpath(bindir, Sys.iswindows() ? "julia.exe" : "julia")
-    (ver, isfile(bin) ? bin : julia)
+    return (ver, isfile(bin) ? bin : julia)
 end
 
 minor_of(ver) = (m = match(r"^(\d+)\.(\d+)\.", ver); m === nothing ? die("cannot parse julia version \"$ver\"") : "$(m[1]).$(m[2])")
@@ -245,14 +249,14 @@ minor_of(ver) = (m = match(r"^(\d+)\.(\d+)\.", ver); m === nothing ? die("cannot
 function parse_duration(s)
     m = match(r"^(\d+(?:\.\d+)?)([smh]?)$", s)
     m === nothing && die("cannot parse duration \"$s\" (seconds, or e.g. 30m, 2h)")
-    parse(Float64, m[1]) * (m[2] == "m" ? 60 : m[2] == "h" ? 3600 : 1)
+    return parse(Float64, m[1]) * (m[2] == "m" ? 60 : m[2] == "h" ? 3600 : 1)
 end
 
 # Sizes for --max-output: bytes, or k/m suffixed ("4096", "16k", "1m").
 function parse_bytes(s)
     m = match(r"^(\d+)([kKmM]?)$", s)
     m === nothing && die("cannot parse size \"$s\" (bytes, or e.g. 16k, 1m)")
-    parse(Int, m[1]) * (lowercase(m[2]) == "k" ? 1024 : lowercase(m[2]) == "m" ? 1024^2 : 1)
+    return parse(Int, m[1]) * (lowercase(m[2]) == "k" ? 1024 : lowercase(m[2]) == "m" ? 1024^2 : 1)
 end
 
 # Run a subprocess, capturing stdout+stderr together instead of streaming it.
@@ -262,11 +266,15 @@ end
 function run_capture(cmd, env)
     tmp = tempname()
     p = open(tmp, "w") do io
-        run(pipeline(ignorestatus(setenv(cmd, env)), stdin=devnull, stdout=io, stderr=io))
+        run(pipeline(ignorestatus(setenv(cmd, env)), stdin = devnull, stdout = io, stderr = io))
     end
-    out = try read(tmp, String) catch; "" end
-    rm(tmp, force=true)
-    (success(p), out)
+    out = try
+        read(tmp, String)
+    catch
+        ""
+    end
+    rm(tmp, force = true)
+    return (success(p), out)
 end
 
 pkg_add_code(specs) = "using Pkg; Pkg.add($(repr(specs)))"
@@ -275,7 +283,7 @@ dev_add_code() = "using Pkg; Pkg.add([PackageSpec(name=n, rev=\"master\") for n 
 # The daemon's deps live in a named depot environment (@jld-v1.X), keyed by
 # julia minor version. Kept out of JLD_HOME so the installation can be
 # read-only; the depot must be writable for Pkg to work at all.
-function ensure_env(julia, version; force=false)
+function ensure_env(julia, version; force = false)
     isempty(Base.DEPOT_PATH) && die("empty DEPOT_PATH; cannot locate a julia depot")
     minor = minor_of(version)
     envdir = joinpath(first(Base.DEPOT_PATH), "environments", "jld-v$minor")
@@ -293,8 +301,10 @@ function ensure_env(julia, version; force=false)
         # never precompiles, so install it from master up front — building a
         # fresh env this way means the failing registry precompile never runs.
         isdev = occursin("DEV", version)
-        info(isdev ? "setting up daemon environment @jld-v$minor from master (one-time, unreleased julia)..." :
-                     "setting up daemon environment @jld-v$minor (one-time, installs $(join(DAEMON_DEPS, ", ")))...")
+        info(
+            isdev ? "setting up daemon environment @jld-v$minor from master (one-time, unreleased julia)..." :
+                "setting up daemon environment @jld-v$minor (one-time, installs $(join(DAEMON_DEPS, ", ")))..."
+        )
         # Precompilation is deferred to ensure_revise_loads: it has to happen
         # in the daemon's stacked load context anyway, and a failure there
         # (e.g. a registry stack too old for an unreleased julia) ends with an
@@ -302,10 +312,10 @@ function ensure_env(julia, version; force=false)
         env = default_julia_env()
         env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
         code = isdev ? dev_add_code() : pkg_add_code(DAEMON_DEPS)
-        p = run(pipeline(ignorestatus(setenv(`$julia --startup-file=no --project=$envdir -e $code`, env)), stdout=stderr, stderr=stderr))
+        p = run(pipeline(ignorestatus(setenv(`$julia --startup-file=no --project=$envdir -e $code`, env)), stdout = stderr, stderr = stderr))
         success(p) || die("failed to set up @jld-v$minor (see errors above)")
     end
-    envdir
+    return envdir
 end
 
 # Probe that Revise loads in the daemon's exact load context (project first,
@@ -319,19 +329,19 @@ function revise_loads(julia, project, envdir)
     sep = Sys.iswindows() ? ";" : ":"
     env["JULIA_LOAD_PATH"] = join(["@", envdir, "@stdlib"], sep)
     cmd = `$julia --startup-file=no --project=$project -e 'import Revise'`
-    run_capture(cmd, env)
+    return run_capture(cmd, env)
 end
 
 # TestEnv is only needed by --test daemons; it is added to the jld env on
 # first use so regular setups don't pay for it.
-function ensure_testenv(julia, envdir)
+function ensure_testenv(julia, envdir::AbstractString)
     prj = read_toml(joinpath(envdir, "Project.toml"))
-    prj !== nothing && haskey(get(prj, "deps", Dict{String,Any}()), "TestEnv") && return
+    prj !== nothing && haskey(get(prj, "deps", Dict{String, Any}()), "TestEnv") && return
     info("adding TestEnv to @$(basename(envdir)) (one-time, used by --test daemons)...")
     env = default_julia_env()
     env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
     ok, out = run_capture(`$julia --startup-file=no --project=$envdir -e $(pkg_add_code(["TestEnv"]))`, env)
-    ok || (print(stderr, out); die("failed to add TestEnv to @$(basename(envdir)) (see errors above)"))
+    return ok || (print(stderr, out); die("failed to add TestEnv to @$(basename(envdir)) (see errors above)"))
 end
 
 # The registry's Revise stack lags julia master; the master branches are the
@@ -340,7 +350,7 @@ function install_dev_stack(julia, envdir)
     info("installing the Revise stack from master into @$(basename(envdir)) (for unreleased julias)...")
     env = default_julia_env()
     env["JULIA_PKG_PRECOMPILE_AUTO"] = "0"
-    run_capture(`$julia --startup-file=no --project=$envdir -e $(dev_add_code())`, env)
+    return run_capture(`$julia --startup-file=no --project=$envdir -e $(dev_add_code())`, env)
 end
 
 # Turns a daemon that would die at startup into an actionable error — and on
@@ -348,7 +358,7 @@ end
 # self-heals by reinstalling from master before giving up. The probe output is
 # kept back and printed only if every attempt fails, so an expected-and-healed
 # precompile failure does not spill a misleading backtrace onto the terminal.
-function ensure_revise_loads(julia, project, envdir, ver; dev_fallback=true)
+function ensure_revise_loads(julia, project, envdir, ver; dev_fallback = true)
     info("verifying the Revise stack loads (precompiling if needed; one-time, may take a few minutes)...")
     ok, out = revise_loads(julia, project, envdir)
     ok && return
@@ -367,7 +377,7 @@ function ensure_revise_loads(julia, project, envdir, ver; dev_fallback=true)
     info("  - start without it: `jld start --no-revise` (source edits then need `jld restart`),")
     info("  - use a --project whose manifest does not pin conflicting versions of Revise's deps, or")
     info("  - reinstall @jld-v$(minor_of(ver)) from master: `jld setup --dev --julia=$julia --project=$project`")
-    exit(1)
+    return exit(1)
 end
 
 # ---- daemon state ----
@@ -375,7 +385,7 @@ end
 # Returns the daemon state Dict, `:timeout` if the socket connects but the
 # daemon does not answer (wedged in a non-yielding eval), or nothing if not
 # running.
-function try_ping(dir; timeout=5.0)
+function try_ping(dir; timeout = 5.0)
     sock = live_sock(dir)
     dbg("ping: connecting to $sock")
     # The connect itself is bounded: against a daemon wedged in a non-yielding
@@ -423,29 +433,36 @@ ping_alive(dir) = try_ping(dir) isa Dict
 # everything behind it for the full ping timeout.
 function filter_probing(probe::Function, ids)
     tasks = [@async probe(id) for id in ids]
-    [id for (id, t) in zip(ids, tasks) if fetch(t)]
+    return [id for (id, t) in zip(ids, tasks) if fetch(t)]
 end
-running_ids(ids=known_ids()) = filter_probing(id -> ping_alive(joinpath(cache_root(), id)), ids)
 
-read_toml(path) = isfile(path) ? (try TOML.parsefile(path) catch; nothing end) : nothing
+running_ids(ids = known_ids()) = filter_probing(id -> ping_alive(joinpath(cache_root(), id)), ids)
+
+read_toml(path) = isfile(path) ? (
+        try
+            TOML.parsefile(path)
+    catch
+            nothing
+    end
+    ) : nothing
 daemon_toml(ctx) = read_toml(joinpath(ctx.dir, "daemon.toml"))
 config_toml(ctx) = read_toml(joinpath(ctx.dir, "config.toml"))
 
 function daemon_pid(ctx)
     dt = daemon_toml(ctx)
-    dt === nothing ? nothing : get(dt, "pid", nothing)
+    return dt === nothing ? nothing : get(dt, "pid", nothing)
 end
 
 log_path(ctx) = joinpath(ctx.dir, "daemon.log")
 
 # Captured precompile progress is full of terminal control sequences
 # (\e[0K etc.); strip them when reading the log back.
-strip_ansi(s) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
+strip_ansi(s::AbstractString) = replace(s, r"\e\[[0-9;?]*[A-Za-z]" => "")
 
-function log_tail(ctx, n)
+function log_tail(ctx, n::Int)
     isfile(log_path(ctx)) || return ""
     lines = readlines(log_path(ctx))
-    join(strip_ansi.(lines[max(1, end-n+1):end]), "\n") * "\n"
+    return join(strip_ansi.(lines[max(1, end - n + 1):end]), "\n") * "\n"
 end
 
 # ---- commands ----
@@ -459,10 +476,10 @@ function cmd_start(ctx, flags)
     chmod(dirname(ctx.dir), 0o700)
     chmod(ctx.dir, 0o700)  # the socket grants code execution as this user
     if !Sys.iswindows()
-        rm(daemon_sock(ctx.dir), force=true)
-        rm(joinpath(ctx.dir, "sock"), force=true)  # legacy location
+        rm(daemon_sock(ctx.dir), force = true)
+        rm(joinpath(ctx.dir, "sock"), force = true)  # legacy location
     end
-    rm(joinpath(ctx.dir, "daemon.toml"), force=true)
+    rm(joinpath(ctx.dir, "daemon.toml"), force = true)
     dbg("start: probing julia")
     ver, julia = probe_julia(ctx.julia, ctx.project)
     dbg("start: julia $ver at $julia")
@@ -475,7 +492,7 @@ function cmd_start(ctx, flags)
     norevise = get(flags, "no-revise", false) && !get(flags, "revise", false)
     idle = haskey(flags, "idle-timeout") ? parse_duration(flags["idle-timeout"]) : 0.0
     norevise || ensure_revise_loads(julia, ctx.project, envdir, ver)
-    cfg = Dict{String,Any}(
+    cfg = Dict{String, Any}(
         "project" => ctx.project, "name" => ctx.name, "julia" => julia,
         "startup" => startup,
     )
@@ -488,7 +505,7 @@ function cmd_start(ctx, flags)
     open(cfgtmp, "w") do io
         TOML.print(io, cfg)
     end
-    mv(cfgtmp, joinpath(ctx.dir, "config.toml"), force=true)
+    mv(cfgtmp, joinpath(ctx.dir, "config.toml"), force = true)
 
     logio = open(log_path(ctx), "a")
     println(logio, "=== jld daemon launch $(Libc.strftime("%Y-%m-%d %H:%M:%S", time())) ===")
@@ -521,8 +538,10 @@ function cmd_start(ctx, flags)
         for std in (0xfffffff6 % UInt32, 0xfffffff5 % UInt32, 0xfffffff4 % UInt32)  # -10, -11, -12
             h = ccall((:GetStdHandle, "kernel32"), stdcall, Ptr{Cvoid}, (UInt32,), std)
             h in (C_NULL, Ptr{Cvoid}(-1)) && continue
-            ccall((:SetHandleInformation, "kernel32"), stdcall, Cint,
-                  (Ptr{Cvoid}, UInt32, UInt32), h, UInt32(1), UInt32(0))
+            ccall(
+                (:SetHandleInformation, "kernel32"), stdcall, Cint,
+                (Ptr{Cvoid}, UInt32, UInt32), h, UInt32(1), UInt32(0)
+            )
         end
     end
     proc = if Sys.iswindows()
@@ -532,11 +551,15 @@ function cmd_start(ctx, flags)
         pesc(s) = "'" * replace(s, "'" => "''") * "'"
         argl = join(map(pesc, vcat(jargs, [joinpath(JLD_HOME, "src", "daemon_main.jl")], dargs)), ",")
         ps = "Start-Process -FilePath $(pesc(julia)) -ArgumentList @($argl) -WindowStyle Hidden"
-        run(pipeline(setenv(`powershell -NoProfile -NonInteractive -Command $ps`, env),
-                     stdin=devnull, stdout=devnull, stderr=devnull))
+        run(
+            pipeline(
+                setenv(`powershell -NoProfile -NonInteractive -Command $ps`, env),
+                stdin = devnull, stdout = devnull, stderr = devnull
+            )
+        )
         nothing
     else
-        run(pipeline(detach(setenv(cmd, env)), stdin=devnull, stdout=logio, stderr=logio), wait=false)
+        run(pipeline(detach(setenv(cmd, env)), stdin = devnull, stdout = logio, stderr = logio), wait = false)
     end
     dbg("start: spawned, waiting for readiness")
     close(logio)
@@ -553,7 +576,7 @@ function cmd_start(ctx, flags)
         end
         st = try_ping(ctx.dir)
         if st isa Dict && !get(st, "booting", false)
-            info("daemon ready in $(round(time() - t0, digits=1))s (pid $(st["pid"]), julia $(st["julia_version"]))")
+            info("daemon ready in $(round(time() - t0, digits = 1))s (pid $(st["pid"]), julia $(st["julia_version"]))")
             if !get(st, "revise", true)
                 get(st, "revise_disabled", false) ?
                     info("Revise disabled (--no-revise); source edits will not auto-apply") :
@@ -564,16 +587,20 @@ function cmd_start(ctx, flags)
             return
         end
         if time() - lastmsg > 5
-            info(st isa Dict ? (ctx.test == "testenv" ?
-                     "activating the test environment... ($(round(Int, time() - t0))s)" :
-                     "running startup code... ($(round(Int, time() - t0))s)") :
-                               "waiting for daemon to load... ($(round(Int, time() - t0))s)")
+            info(
+                st isa Dict ? (
+                        ctx.test == "testenv" ?
+                        "activating the test environment... ($(round(Int, time() - t0))s)" :
+                        "running startup code... ($(round(Int, time() - t0))s)"
+                    ) :
+                    "waiting for daemon to load... ($(round(Int, time() - t0))s)"
+            )
             lastmsg = time()
         end
         sleep(0.2)
     end
     info("timed out after $(timeout)s waiting for daemon; it may still be loading. Check `jld logs`.")
-    exit(1)
+    return exit(1)
 end
 
 # Reuse options recorded by a previous `jld start` unless overridden now.
@@ -589,7 +616,7 @@ function apply_cfg(ctx, flags, cfg)
         j = get(cfg, "julia", "")
         isfile(j) && return Ctx(ctx.project, ctx.name, ctx.id, ctx.dir, j, ctx.checkout, ctx.test)
     end
-    ctx
+    return ctx
 end
 
 function ensure_running(ctx, flags)
@@ -606,12 +633,12 @@ function ensure_running(ctx, flags)
     # Autostarting the default-environment daemon while others run is easy to
     # do by accident (e.g. forgetting --id in a project-less directory); say so.
     if !haskey(flags, "id") && find_project(get(flags, "project", nothing)) === nothing &&
-       find_checkout() === nothing
+            find_checkout() === nothing
         others = running_ids(filter(!=(ctx.id), known_ids()))
         isempty(others) ||
             info("no project here — autostarting a default-environment daemon; other running daemons: $(join(others, ", ")) (`--id` targets one)")
     end
-    cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
+    return cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
 end
 
 function cmd_exec(ctx, kind, arg, flags)
@@ -631,7 +658,7 @@ function cmd_exec(ctx, kind, arg, flags)
     catch
         die("cannot connect to daemon socket; try `jld restart`", 3)
     end
-    req = Dict{String,Any}("kind" => kind, "code" => code, "cwd" => pwd())
+    req = Dict{String, Any}("kind" => kind, "code" => code, "cwd" => pwd())
     m = get(flags, "module", "")
     if !isempty(m)
         Base.isidentifier(m) || die("--module must be a simple identifier, got \"$m\"")
@@ -641,7 +668,7 @@ function cmd_exec(ctx, kind, arg, flags)
     get(flags, "scratch", false) && (req["scratch"] = true)
     haskey(flags, "max-output") && (req["max_output"] = parse_bytes(flags["max-output"]))
     write_frame(conn, "req", sprint(io -> TOML.print(io, req)))
-    exit(stream_response(ctx, conn, flags))
+    return exit(stream_response(ctx, conn, flags))
 end
 
 function stream_response(ctx, conn, flags)
@@ -746,7 +773,7 @@ function escalate_timeout(ctx, reader, send_interrupt)
         send_interrupt()
     end
     istaskdone(reader) && return
-    if get(something(daemon_toml(ctx), Dict{String,Any}()), "kind", "") == "session"
+    if get(something(daemon_toml(ctx), Dict{String, Any}()), "kind", "") == "session"
         info("eval did not yield within $(ESCALATE_GRACE)s and the daemon is an interactive session; not killing it — the eval keeps running there")
         exit(124)
     end
@@ -755,7 +782,7 @@ function escalate_timeout(ctx, reader, send_interrupt)
         uv_kill(pid, SIGKILL_)
         info("eval did not yield within $(ESCALATE_GRACE)s; killed the daemon (pid $pid) — the next call starts a fresh one")
     end
-    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
+    return Sys.iswindows() || rm(daemon_sock(ctx.dir), force = true)
 end
 
 function cmd_stop(ctx)
@@ -788,7 +815,7 @@ function cmd_stop(ctx)
     end
     # Never escalate to signals against an interactive session: a transient
     # handshake failure must not kill the user's REPL.
-    session = get(something(daemon_toml(ctx), Dict{String,Any}()), "kind", "") == "session"
+    session = get(something(daemon_toml(ctx), Dict{String, Any}()), "kind", "") == "session"
     handshake_err !== nothing &&
         info("shutdown handshake failed: $(sprint(showerror, handshake_err))")
     session && die("this daemon is an interactive session and did not confirm shutdown; not signaling it", 3)
@@ -799,7 +826,7 @@ function cmd_stop(ctx)
     else
         info("daemon not running")
     end
-    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
+    return Sys.iswindows() || rm(daemon_sock(ctx.dir), force = true)
 end
 
 function cmd_kill(ctx)
@@ -810,7 +837,7 @@ function cmd_kill(ctx)
     else
         info("daemon not running")
     end
-    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
+    return Sys.iswindows() || rm(daemon_sock(ctx.dir), force = true)
 end
 
 function cmd_restart(ctx, flags)
@@ -824,7 +851,7 @@ function cmd_restart(ctx, flags)
         end
         pid_alive(pid) && (uv_kill(pid, SIGKILL_); sleep(0.2))
     end
-    cmd_start(apply_cfg(ctx, flags, cfg), flags)
+    return cmd_start(apply_cfg(ctx, flags, cfg), flags)
 end
 
 # One-shot interrupt request; false when it could not be delivered or the
@@ -832,7 +859,7 @@ end
 # wedged in a non-yielding eval may never answer (connect still succeeds via
 # the listen backlog), and the --force path must reach its SIGKILL instead of
 # waiting the eval out.
-function send_interrupt_frame(ctx; timeout=2.0)
+function send_interrupt_frame(ctx; timeout = 2.0)
     c = @async connect(live_sock(ctx.dir))
     task_done_within(c, timeout) || return false
     conn = try
@@ -840,7 +867,7 @@ function send_interrupt_frame(ctx; timeout=2.0)
     catch
         return false
     end
-    try
+    return try
         write_frame(conn, "interrupt")
         t = @async read_frame(conn)
         task_done_within(t, timeout) || return false
@@ -853,9 +880,9 @@ function send_interrupt_frame(ctx; timeout=2.0)
     end
 end
 
-function cmd_interrupt(ctx, flags=Dict{String,Any}())
+function cmd_interrupt(ctx, flags = Dict{String, Any}())
     force = get(flags, "force", false)
-    force && get(something(daemon_toml(ctx), Dict{String,Any}()), "kind", "") == "session" &&
+    force && get(something(daemon_toml(ctx), Dict{String, Any}()), "kind", "") == "session" &&
         die("this daemon is an interactive session; not killing it (plain `jld interrupt` soft-interrupts)", 3)
     st = try_ping(ctx.dir)
     if st === nothing
@@ -876,7 +903,7 @@ function cmd_interrupt(ctx, flags=Dict{String,Any}())
     ok = send_interrupt_frame(ctx)
     if !force
         ok ? info("interrupt requested; it lands at the eval's next yield point (CPU-bound code may run to completion first — `jld interrupt --force` kills and restarts if it never yields)") :
-             info("could not interrupt (eval not at a yield point); `jld interrupt --force` kills and restarts the daemon")
+            info("could not interrupt (eval not at a yield point); `jld interrupt --force` kills and restarts the daemon")
         return
     end
     # --force: give the soft interrupt a grace period, then kill and restart
@@ -894,24 +921,24 @@ function cmd_interrupt(ctx, flags=Dict{String,Any}())
     end
     pid = daemon_pid(ctx)
     pid !== nothing && pid_alive(pid) && uv_kill(pid, SIGKILL_)
-    Sys.iswindows() || rm(daemon_sock(ctx.dir), force=true)
+    Sys.iswindows() || rm(daemon_sock(ctx.dir), force = true)
     info("eval did not yield within $(ESCALATE_GRACE)s; killed the daemon (pid $(something(pid, "?"))), restarting it")
-    cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
+    return cmd_start(apply_cfg(ctx, flags, config_toml(ctx)), flags)
 end
 
 # Compact duration for "how long ago": 42s, 17m, 3.5h, 2.1d.
 fmt_ago(s::Real) =
     s < 90 ? "$(round(Int, s))s" :
     s < 90 * 60 ? "$(round(Int, s / 60))m" :
-    s < 48 * 3600 ? "$(round(s / 3600, digits=1))h" :
-    "$(round(s / 86400, digits=1))d"
+    s < 48 * 3600 ? "$(round(s / 3600, digits = 1))h" :
+    "$(round(s / 86400, digits = 1))d"
 
 function cmd_status(ctx)
     st = try_ping(ctx.dir)
     dt = daemon_toml(ctx)
     println("id:       ", ctx.id)
     tsuf = ctx.test == "testenv" ? " (test env via TestEnv.activate())" :
-           ctx.test == "workspace" ? " (test workspace project)" : ""
+        ctx.test == "workspace" ? " (test workspace project)" : ""
     isempty(ctx.checkout) ?
         println("project:  ", ctx.project, tsuf) :
         println("project:  ", ctx.checkout, " (checkout; scratch env ", ctx.project, ")")
@@ -927,8 +954,10 @@ function cmd_status(ctx)
         end
         return
     end
-    println("state:    ", get(st, "booting", false) ? "starting (running --startup code)" :
-                          st["busy"] ? "busy" : "idle")
+    println(
+        "state:    ", get(st, "booting", false) ? "starting (running --startup code)" :
+            st["busy"] ? "busy" : "idle"
+    )
     if !get(st, "revise", true)
         get(st, "revise_disabled", false) ?
             println("revise:   disabled (--no-revise)") :
@@ -939,22 +968,24 @@ function cmd_status(ctx)
     st["busy"] && println("running:  `$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s")
     println("pid:      ", st["pid"])
     println("julia:    ", st["julia_version"])
-    println("uptime:   ", round(st["uptime"] / 60, digits=1), " min")
+    println("uptime:   ", round(st["uptime"] / 60, digits = 1), " min")
     ifor = get(st, "idle_for", nothing)
     if ifor isa Real && !st["busy"]
-        println("last:     ", get(st, "seen_request", true) ?
-            "$(fmt_ago(ifor)) ago" : "no requests served yet")
+        println(
+            "last:     ", get(st, "seen_request", true) ?
+                "$(fmt_ago(ifor)) ago" : "no requests served yet"
+        )
     end
     it = get(st, "idle_timeout", 0.0)
     it isa Real && it > 0 && println("idle:     stops after $(round(Int, it))s without requests (--idle-timeout)")
     if dt !== nothing
         println("REPL:     jld connect")
     end
-    isfile(joinpath(ctx.dir, "transcript.log")) &&
+    return isfile(joinpath(ctx.dir, "transcript.log")) &&
         println("history:  jld transcript   ($(joinpath(ctx.dir, "transcript.log")))")
 end
 
-function cmd_list(flags=Dict{String,Any}())
+function cmd_list(flags = Dict{String, Any}())
     root = cache_root()
     # The daemon this context would target (what `jld eval` here acts upon).
     target = try
@@ -963,7 +994,7 @@ function cmd_list(flags=Dict{String,Any}())
         nothing
     end
     showall = get(flags, "all", false)
-    rows = Vector{NTuple{7,String}}()
+    rows = Vector{NTuple{7, String}}()
     hidden = String[]
     ids = known_ids()
     # Ping every daemon concurrently: sequential pings make the list linear in
@@ -979,7 +1010,7 @@ function cmd_list(flags=Dict{String,Any}())
         st = fetch(pings[n])
         session = (st isa Dict ? get(st, "kind", "") : get(cfg, "kind", "")) == "session"
         state = st isa Dict ? (get(st, "booting", false) ? "starting" : st["busy"] ? "busy" : "idle") :
-                st === :timeout ? "unresponsive" : "dead"
+            st === :timeout ? "unresponsive" : "dead"
         session && (state *= "/repl")
         # Dead daemons clutter the list; keep them out of it (but never hide
         # what this context targets), summarized below.
@@ -989,7 +1020,7 @@ function cmd_list(flags=Dict{String,Any}())
         end
         dt = read_toml(joinpath(dir, "daemon.toml"))
         pid = st isa Dict ? string(st["pid"]) :
-              st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
+            st === :timeout && dt !== nothing ? string(get(dt, "pid", "-")) : "-"
         jver = dt !== nothing ? string(get(dt, "julia_version", "-")) : "-"
         proj = haskey(cfg, "checkout") ? string(cfg["checkout"], " (checkout)") : get(cfg, "project", "?")
         isempty(get(cfg, "test", "")) || (proj = string(proj, " (test)"))
@@ -1004,19 +1035,21 @@ function cmd_list(flags=Dict{String,Any}())
     end
     header = ("#", "ID", "STATE", "IDLE", "PID", "JULIA", "PROJECT")
     widths = [maximum(length.([header[i], (r[i] for r in rows)...])) for i in 1:6]
-    printrow(r; mark="  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:6], "  "), "  ", r[7])
+    printrow(r; mark = "  ") = println(mark, join([rpad(r[i], widths[i]) for i in 1:6], "  "), "  ", r[7])
     printrow(header)
-    foreach(r -> printrow(r; mark=(r[2] == target ? "* " : "  ")), rows)
+    foreach(r -> printrow(r; mark = (r[2] == target ? "* " : "  ")), rows)
     ndead = count(r -> startswith(r[3], "dead"), rows)
-    if !isempty(hidden)
+    return if !isempty(hidden)
         info("not shown (dead): $(join(hidden, ", ")) — `jld list --all` lists them, `jld gc` removes their state")
     elseif ndead > 0
         info("$ndead dead; `jld gc` removes their state (config, log, transcript)")
     end
 end
 
-known_ids() = (root = cache_root(); isdir(root) ?
-    filter(d -> isfile(joinpath(root, d, "config.toml")), sort(readdir(root))) : String[])
+known_ids() = (
+    root = cache_root(); isdir(root) ?
+        filter(d -> isfile(joinpath(root, d, "config.toml")), sort(readdir(root))) : String[]
+)
 
 function ctx_from_id(idarg)
     ids = known_ids()
@@ -1038,15 +1071,17 @@ function ctx_from_id(idarg)
         matches = running
     end
     id = idarg in matches ? idarg : only(matches)
-    ctx_from_known(id)
+    return ctx_from_known(id)
 end
 
 function ctx_from_known(id)
     dir = joinpath(cache_root(), id)
     cfg = read_toml(joinpath(dir, "config.toml"))
     cfg === nothing && die("unreadable daemon state in $dir")
-    Ctx(get(cfg, "project", ""), get(cfg, "name", ""), id, dir, get(cfg, "julia", "julia"),
-        get(cfg, "checkout", ""), get(cfg, "test", ""))
+    return Ctx(
+        get(cfg, "project", ""), get(cfg, "name", ""), id, dir, get(cfg, "julia", "julia"),
+        get(cfg, "checkout", ""), get(cfg, "test", "")
+    )
 end
 
 # With no project and no id: prefer the daemon `jld eval` would target (the
@@ -1062,7 +1097,7 @@ function ctx_from_only_running(flags, exists::Function)
         cmd_list()
         exit(2)
     end
-    ctx_from_id(only(running))
+    return ctx_from_id(only(running))
 end
 
 # Paste code into an attached `jld connect` REPL, as if typed there.
@@ -1077,7 +1112,7 @@ function cmd_eval_repl(ctx, arg)
     write_frame(conn, "paste", code)
     kind, _ = read_frame(conn)
     close(conn)
-    kind == "done" || die("REPL did not acknowledge the paste", 3)
+    return kind == "done" || die("REPL did not acknowledge the paste", 3)
 end
 
 # eval-repl outside a project: the default-env daemon if a REPL is attached
@@ -1090,7 +1125,7 @@ function ctx_for_eval_repl(flags)
     isempty(attached) && die("no attached REPL found; start one with `jld connect`", 3)
     length(attached) > 1 &&
         die("multiple attached REPLs ($(join(attached, ", "))); pass --id", 3)
-    ctx_from_id(only(attached))
+    return ctx_from_id(only(attached))
 end
 
 # Remove state directories (config, log, transcript) of dead daemons.
@@ -1110,11 +1145,11 @@ function cmd_gc()
         # No daemon.toml yet + fresh config: probably still starting up.
         cfg = joinpath(dir, "config.toml")
         dt === nothing && isfile(cfg) && time() - mtime(cfg) < 120 && continue
-        rm(dir; recursive=true, force=true)
+        rm(dir; recursive = true, force = true)
         info("removed $id")
         removed += 1
     end
-    removed == 0 && info("no dead daemons to remove")
+    return removed == 0 && info("no dead daemons to remove")
 end
 
 function cmd_connect(ctx, flags)
@@ -1123,10 +1158,10 @@ function cmd_connect(ctx, flags)
     if st === nothing
         ensure_running(ctx, flags)
         st = try_ping(ctx.dir)
-        st isa Dict || die("daemon did not come up; see `jld logs`", 3)
     end
+    st isa Dict || die("daemon did not come up; see `jld logs`", 3)
     st["busy"] && info("note: daemon is busy (`$(get(st, "current", "?"))` for $(get(st, "current_elapsed", "?"))s); the REPL shares the session and runs alongside it")
-    dt = something(daemon_toml(ctx), Dict{String,Any}())
+    dt = something(daemon_toml(ctx), Dict{String, Any}())
     sockpath = live_sock(ctx.dir)
     if get(flags, "print", false)
         println("daemon socket: $sockpath (framed text protocol; any julia can attach)")
@@ -1145,7 +1180,7 @@ function cmd_connect(ctx, flags)
     # default_julia_env: the app shim pins JULIA_LOAD_PATH to the app env,
     # which lacks @stdlib and would break the connect script's stdlib imports.
     p = run(ignorestatus(setenv(`$julia --project=$(ctx.project) -i $script $sockpath $inputsock $(ctx.id)`, default_julia_env())))
-    exit(p.exitcode)
+    return exit(p.exitcode)
 end
 
 function cmd_logs(ctx, flags)
@@ -1163,16 +1198,18 @@ function cmd_logs(ctx, flags)
         n < length(lines) &&
             info("last $n of $(length(lines)) lines ($path); --lines=N or --all for the rest")
     end
-    isempty(lines) || println(join(strip_ansi.(lines[max(1, end-n+1):end]), "\n"))
+    return isempty(lines) || println(join(strip_ansi.(lines[max(1, end - n + 1):end]), "\n"))
 end
 
 # Ask the daemon's control thread to profile the process for ~1s and report
 # per-thread/task backtraces — shows what a busy daemon is doing.
 function cmd_stacks(ctx)
-    st = try_ping(ctx.dir; timeout=10.0)
-    st isa Dict || die(st === :timeout ?
-        "daemon unresponsive (started before thread support? `jld restart`)" :
-        "daemon not running", 3)
+    st = try_ping(ctx.dir; timeout = 10.0)
+    st isa Dict || die(
+        st === :timeout ?
+            "daemon unresponsive (started before thread support? `jld restart`)" :
+            "daemon not running", 3
+    )
     conn = try
         connect(live_sock(ctx.dir))
     catch
@@ -1191,7 +1228,7 @@ function cmd_stacks(ctx)
         end
     end
     close(conn)
-    got || info("daemon returned no stacks (predates this feature? `jld restart`)")
+    return got || info("daemon returned no stacks (predates this feature? `jld restart`)")
 end
 
 # Errors shown by eval/run collapse runs of internal frames; the daemon saves
@@ -1199,13 +1236,13 @@ end
 function cmd_trace(ctx)
     path = joinpath(ctx.dir, "lasterror.log")
     isfile(path) || die("no error recorded for $(ctx.id); the full backtrace of the last eval error lands here", 3)
-    write(stdout, read(path))
+    return write(stdout, read(path))
 end
 
 function cmd_transcript(ctx, flags)
     path = joinpath(ctx.dir, "transcript.log")
     isfile(path) || die("no transcript for $(ctx.id) yet", 3)
-    if get(flags, "follow", false)
+    return if get(flags, "follow", false)
         run(`tail -n 100 -f $path`)
     else
         write(stdout, read(path))
@@ -1221,7 +1258,7 @@ function install_link(link, target)
     end
     mkpath(dirname(link))
     symlink(target, link)
-    info("installed $link -> $target")
+    return info("installed $link -> $target")
 end
 
 function cmd_install()
@@ -1240,13 +1277,13 @@ function cmd_install()
         islink(dst) && rm(dst)
         mkpath(dst)
         for f in readdir(src)
-            cp(joinpath(src, f), joinpath(dst, f); force=true)
+            cp(joinpath(src, f), joinpath(dst, f); force = true)
         end
         info("installed skill: $dst")
     end
     # A bin symlink is only needed when jld is not already reachable
     # (the Pkg app shim in ~/.julia/bin makes this unnecessary).
-    if Sys.which("jld") === nothing
+    return if Sys.which("jld") === nothing
         install_link(joinpath(homedir(), ".local", "bin", "jld"), joinpath(JLD_HOME, "bin", "jld"))
         bindir = joinpath(homedir(), ".local", "bin")
         any(p -> abspath(p) == bindir, split(get(ENV, "PATH", ""), ':')) ||
@@ -1254,17 +1291,17 @@ function cmd_install()
     end
 end
 
-function cmd_setup(ctx, flags=Dict{String,Any}())
+function cmd_setup(ctx, flags = Dict{String, Any}())
     ver, julia = probe_julia(ctx.julia, ctx.project)
     dev = get(flags, "dev", false)
-    envdir = ensure_env(julia, ver, force=!dev)
+    envdir = ensure_env(julia, ver, force = !dev)
     ctx.test == "testenv" && ensure_testenv(julia, envdir)
     if dev
         iok, iout = install_dev_stack(julia, envdir)
         iok || (print(stderr, iout); die("master install failed (see errors above)"))
     end
-    ensure_revise_loads(julia, ctx.project, envdir, ver; dev_fallback=!dev)
-    info("daemon environment ready")
+    ensure_revise_loads(julia, ctx.project, envdir, ver; dev_fallback = !dev)
+    return info("daemon environment ready")
 end
 
 const HELP = """
@@ -1346,18 +1383,20 @@ runs Revise.track(Base) at boot, so Base/stdlib edits apply live.
 """
 
 function parse_cli(args)
-    flags = Dict{String,Any}()
+    flags = Dict{String, Any}()
     pos = String[]
     for a in args
         if a == "-f"
             flags["follow"] = true
         elseif startswith(a, "--")
             if contains(a, "=")
-                k, v = split(a[3:end], "=", limit=2)
+                k, v = split(a[3:end], "=", limit = 2)
                 if k == "startup"
                     push!(get!(Vector{String}, flags, "startup"), String(v))
-                elseif k in ("project", "name", "julia", "threads", "timeout", "module", "id", "lines",
-                             "idle-timeout", "max-output")
+                elseif k in (
+                        "project", "name", "julia", "threads", "timeout", "module", "id", "lines",
+                        "idle-timeout", "max-output",
+                    )
                     flags[String(k)] = String(v)
                 else
                     die("unknown flag --$k")
@@ -1371,7 +1410,7 @@ function parse_cli(args)
             push!(pos, a)
         end
     end
-    (flags, pos)
+    return (flags, pos)
 end
 
 function run_cli(args::Vector{String})
@@ -1383,10 +1422,10 @@ function run_cli(args::Vector{String})
     cmd = pos[1]
     # --id targets an existing daemon directly, bypassing project resolution.
     byid = haskey(flags, "id")
-    resolve(posid=nothing) = byid ? ctx_from_id(flags["id"]) :
-                             posid !== nothing ? ctx_from_id(posid) : make_ctx(flags)
+    resolve(posid = nothing) = byid ? ctx_from_id(flags["id"]) :
+        posid !== nothing ? ctx_from_id(posid) : make_ctx(flags)
     outside_project() = !byid && find_project(get(flags, "project", nothing)) === nothing &&
-                        find_checkout() === nothing
+        find_checkout() === nothing
 
     if cmd == "list"
         cmd_list(flags)
@@ -1407,7 +1446,7 @@ function run_cli(args::Vector{String})
     elseif cmd == "connect"
         posid = length(pos) >= 2 ? pos[2] : nothing
         ctx = posid === nothing && outside_project() ?
-              ctx_from_only_running(flags, c -> try_ping(c.dir) !== nothing) : resolve(posid)
+            ctx_from_only_running(flags, c -> try_ping(c.dir) !== nothing) : resolve(posid)
         cmd_connect(ctx, flags)
         return
     elseif cmd == "eval-repl"
@@ -1418,34 +1457,34 @@ function run_cli(args::Vector{String})
         posid = length(pos) >= 2 ? pos[2] : nothing
         ctx = if posid === nothing && outside_project()
             exists = cmd == "transcript" ? (c -> isfile(joinpath(c.dir, "transcript.log"))) :
-                     cmd == "logs" ? (c -> isfile(log_path(c))) :
-                     cmd == "trace" ? (c -> isfile(joinpath(c.dir, "lasterror.log"))) :
-                     (c -> try_ping(c.dir) !== nothing)
+                cmd == "logs" ? (c -> isfile(log_path(c))) :
+                cmd == "trace" ? (c -> isfile(joinpath(c.dir, "lasterror.log"))) :
+                (c -> try_ping(c.dir) !== nothing)
             ctx_from_only_running(flags, exists)
         else
             resolve(posid)
         end
         cmd == "transcript" ? cmd_transcript(ctx, flags) :
-        cmd == "logs" ? cmd_logs(ctx, flags) :
-        cmd == "trace" ? cmd_trace(ctx) : cmd_stacks(ctx)
+            cmd == "logs" ? cmd_logs(ctx, flags) :
+            cmd == "trace" ? cmd_trace(ctx) : cmd_stacks(ctx)
         return
     elseif cmd in ("stop", "interrupt", "kill", "restart")
         # Outside a project, act on the unique running daemon when the
         # default-env identity has nothing to act on.
         ctx = if outside_project()
             exists = cmd == "restart" ? (c -> isfile(joinpath(c.dir, "config.toml"))) :
-                                        (c -> try_ping(c.dir) !== nothing)
+                (c -> try_ping(c.dir) !== nothing)
             ctx_from_only_running(flags, exists)
         else
             resolve()
         end
         cmd == "stop" ? cmd_stop(ctx) :
-        cmd == "interrupt" ? cmd_interrupt(ctx, flags) :
-        cmd == "kill" ? cmd_kill(ctx) : cmd_restart(ctx, flags)
+            cmd == "interrupt" ? cmd_interrupt(ctx, flags) :
+            cmd == "kill" ? cmd_kill(ctx) : cmd_restart(ctx, flags)
         return
     end
     ctx = resolve()
-    if cmd == "eval"
+    return if cmd == "eval"
         cmd_exec(ctx, "eval", length(pos) >= 2 ? pos[2] : nothing, flags)
     elseif cmd == "run"
         cmd_exec(ctx, "include", length(pos) >= 2 ? pos[2] : nothing, flags)
@@ -1460,7 +1499,7 @@ end
 
 # Exit quietly when stdout goes away mid-write (e.g. `jld list | head`).
 function cli_main(args)
-    try
+    return try
         run_cli(args)
     catch e
         e isa Base.IOError && occursin("EPIPE", e.msg) && exit(0)

@@ -221,7 +221,7 @@ is doing step by step.
 
 Your interactive REPL can be a daemon too:
 
-```julia
+```julia-repl
 julia> using JuliaDaemon
 julia> JuliaDaemon.serve()        # or serve(name="mysession")
 ```
