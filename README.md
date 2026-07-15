@@ -2,6 +2,31 @@
 
 [![CI](https://github.com/KristofferC/JuliaDaemon.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/KristofferC/JuliaDaemon.jl/actions/workflows/ci.yml)
 
+## TL;DR
+
+`jld` keeps one warm, Revise-enabled Julia process per project so coding
+agents (and you) shell out into the *same* session instead of paying package
+load and compile latency on every `julia -e`. Install it as a Pkg app and
+register the agent skill:
+
+```sh
+pkg> app add <this repo url>   # julia 1.12+; drops `jld` in ~/.julia/bin (keep on PATH)
+$ jld install                  # installs the agent skill so agents use the daemon
+```
+
+Then just use it:
+
+```sh
+cd MyPkg
+jld eval 'using MyPkg; MyPkg.foo()'   # first call starts the daemon and loads MyPkg
+jld connect                           # attach a REPL into that same session
+```
+
+More on [what it does](#how-it-works), the [commands](#commands), and
+[install details](#install) below.
+
+## What it is
+
 `jld` keeps a Julia process alive for each of your projects, with
 [Revise](https://github.com/timholy/Revise.jl) loaded, and lets you run code
 in it from the shell. Package loading and compilation happen once, when the
