@@ -688,18 +688,19 @@ function eval_loop(requests)
             e isa InterruptException && continue
             rethrow()
         end
-        if req.cancelled[]
-            req.done[] || safe_send(req, "done", "status = \"interrupted\"\n")
-            req.done[] = true
-            try
-                close(req.sock)
-            catch end
-            continue
-        end
-        CURRENT[] = req
-        CURRENT_T0[] = time()
+        # Nothing per-request may escape this loop: if EVAL_TASK dies the whole
+        # daemon goes with it (serve waits on it), silently dropping the session
+        # and its state. In particular a stray InterruptException — a
+        # disconnect-race interrupt that lands after its eval already finished —
+        # must be swallowed here rather than propagate.
         try
-            run_request(req)
+            if req.cancelled[]
+                req.done[] || safe_send(req, "done", "status = \"interrupted\"\n")
+            else
+                CURRENT[] = req
+                CURRENT_T0[] = time()
+                run_request(req)
+            end
         catch e
             e isa InterruptException || logmsg("request failed internally: $(sprint(showerror, e, catch_backtrace()))")
         finally
@@ -851,11 +852,11 @@ function run_request(req)
     end
     donepayload = "status = \"$status\"\nelapsed = $(round(time() - t0, digits = 3))\n"
     status == "exit" && (donepayload *= "exitcode = $exitcode\n")
-    safe_send(req, "done", donepayload)
-    # Mark done before the client reacts to the done frame: it closes its end
-    # immediately, and the request reader must not mistake that for a
-    # disconnect-during-eval and fire an interrupt.
+    # Mark done before sending, not after: the client closes its end the instant
+    # it reads the done frame, and the request reader must not mistake that close
+    # for a disconnect-during-eval and fire a (now stray) interrupt.
     req.done[] = true
+    safe_send(req, "done", donepayload)
     # For files, record the contents: scratch scripts get rewritten between
     # runs, so the path alone would lose the session history.
     if req.kind == "include"
